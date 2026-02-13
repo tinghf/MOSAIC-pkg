@@ -2,7 +2,7 @@
 
 This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
 
-**Last Updated**: 2026-02-03
+**Last Updated**: 2026-02-13
 **Primary Sources**: README.md, DESCRIPTION, .github/workflows/R-CMD-check.yaml, NEWS.md, inst/py/environment.yml
 **External Documentation**: https://institutefordiseasemodeling.github.io/MOSAIC-docs/
 
@@ -13,6 +13,42 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 ## Overview
 
 MOSAIC (Metapopulation Outbreak Simulation with Agent-based Implementation for Cholera) is an R package that simulates cholera transmission dynamics in Sub-Saharan Africa using a metapopulation model with Bayesian calibration. The package wraps the Python-based **LASER-cholera** model and provides tools for parameter estimation, environmental forcing (climate data), mobility patterns, and intervention scenarios (vaccination).
+
+## Quick Start
+
+### Getting Started with MOSAIC on a VM
+
+**Recommended Development Environment**: Starsim Hedgehog Server
+- Access at: http://selfserve.starsim.org/
+- Provides bare Ubuntu environment from Azure (Standard_HB120rs_v2 (HPC optimized - 120 cores, 456GB)
+
+**Automated Setup**:
+```bash
+# Run the setup script to install all Python and R dependencies
+bash vm/setup_mosaic.sh
+```
+
+This script ([vm/setup_mosaic.sh](https://github.com/InstituteforDiseaseModeling/MOSAIC-pkg/blob/main/vm/setup_mosaic.sh)) handles:
+- System dependency installation (Ubuntu packages)
+- R package installation
+- Conda environment creation with Python dependencies
+- Environment configuration
+
+**Running Your First Model**:
+
+After setup completes, you can run MOSAIC simulations:
+
+1. **Toy Examples** (recommended for first-time users):
+   - [Running LASER](https://institutefordiseasemodeling.github.io/MOSAIC-pkg/articles/Running-LASER.html) - Simple simulation with LASER engine
+   - [Running MOSAIC](https://institutefordiseasemodeling.github.io/MOSAIC-pkg/articles/Running-MOSAIC.html) - Basic BFRS calibration workflow
+
+2. **Substantial Example**:
+   - Full model run script: [vm/launch_mosaic.R](https://github.com/InstituteforDiseaseModeling/MOSAIC-pkg/blob/main/vm/launch_mosaic.R)
+   - Demonstrates real-world calibration with multiple countries/regions
+
+**Troubleshooting Setup**:
+- If setup fails with "'lib' is not writable" error, see the workaround in the [Package Installation and Setup](#package-installation-and-setup) section below
+- Verify successful installation with `Rscript -e 'MOSAIC::check_dependencies()'`
 
 ## Common Development Commands
 
