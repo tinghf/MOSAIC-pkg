@@ -13,6 +13,7 @@ if [[ "$OS" == "Linux" ]]; then
   sudo apt-get update
   sudo apt-get install -y \
     jags \
+    cmake \
     libssl-dev \
     libudunits2-dev \
     libproj-dev \

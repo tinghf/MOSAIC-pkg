@@ -1,0 +1,61 @@
+version: '3.8'
+
+services:
+  mosaic:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: mosaic:latest
+    container_name: mosaic-workspace
+
+    # Mount local directories
+    volumes:
+      - ./model:/workspace/model
+      - ./data:/workspace/data
+      # Uncomment to persist R packages across container rebuilds
+      # - mosaic-r-libs:/usr/local/lib/R/site-library
+      # Uncomment to persist conda environment across rebuilds
+      # - mosaic-conda:/root/.local/share/r-miniconda
+
+    # Resource limits (adjust based on your MOSAIC workflow needs)
+    deploy:
+      resources:
+        limits:
+          cpus: '8'
+          memory: 16G
+        reservations:
+          cpus: '4'
+          memory: 8G
+
+    # Environment variables (override threading defaults if needed)
+    environment:
+      - OMP_NUM_THREADS=1
+      - MOSAIC_N_CORES=4  # Adjust for your hardware
+
+    # Keep container running for interactive use
+    stdin_open: true
+    tty: true
+
+    # Default command
+    command: R
+
+  # Optional: RStudio Server interface
+  # Uncomment to access MOSAIC via RStudio in browser (http://localhost:8787)
+  # mosaic-rstudio:
+  #   image: rocker/geospatial:4.4
+  #   container_name: mosaic-rstudio
+  #   ports:
+  #     - "8787:8787"
+  #   volumes:
+  #     - ./model:/home/rstudio/model
+  #     - ./data:/home/rstudio/data
+  #     - mosaic-r-libs:/usr/local/lib/R/site-library
+  #   environment:
+  #     - PASSWORD=mosaic  # Change this!
+  #     - ROOT=TRUE
+  #   command: /init
+
+# Named volumes (uncomment if using persistent storage)
+# volumes:
+#   mosaic-r-libs:
+#   mosaic-conda:

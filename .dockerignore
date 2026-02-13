@@ -1,0 +1,56 @@
+# Git
+.git
+.gitignore
+.github
+
+# R package build artifacts
+*.tar.gz
+*.Rcheck/
+.Rproj.user
+.Rhistory
+.RData
+.Ruserdata
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+.Python
+*.so
+.ipynb_checkpoints/
+.virtualenvs/
+.conda/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# MOSAIC specific
+model/output/**
+*.log
+mosaic_install_*.log
+
+# Documentation build
+docs/
+_site/
+pkgdown/
+
+# Large data files (if any in repo)
+*.hdf5
+*.h5
+*.nc
+*.tif
+*.geojson
+
+# VM setup artifacts
+vm/*.log
+Miniforge3-*.sh
+*.docx
+*.docx:Zone.Identifier
