@@ -22,6 +22,12 @@ MOSAIC (Metapopulation Outbreak Simulation with Agent-based Implementation for C
 # Install system dependencies (Linux/macOS)
 bash inst/bin/setup_mosaic.sh
 
+# If setup_mosaic.sh fails installing R packages with a
+# "'lib' is not writable" error, create a user library first:
+#   mkdir -p ~/R/library
+#   echo 'R_LIBS_USER=~/R/library' >> ~/.Renviron
+# Then re-run the script.
+
 # Install R package from source
 R CMD INSTALL .
 
