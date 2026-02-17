@@ -1,0 +1,524 @@
+---
+title: "Deploying MOSAIC on Slurm HPC Clusters"
+author: "MOSAIC Development Team"
+date: "`r Sys.Date()`"
+output: rmarkdown::html_vignette
+vignette: >
+  %\VignetteIndexEntry{Deploying MOSAIC on Slurm HPC Clusters}
+  %\VignetteEngine{knitr::rmarkdown}
+  %\VignetteEncoding{UTF-8}
+---
+
+```{r setup, include = FALSE}
+knitr::opts_chunk$set(
+  collapse = TRUE,
+  comment = "#>",
+  eval = FALSE
+)
+```
+
+# Introduction
+
+This vignette demonstrates how to deploy MOSAIC calibrations on Slurm HPC clusters using `future.batchtools`. This approach enables scaling MOSAIC simulations across hundreds of compute nodes, reducing calibration time from days to hours.
+
+## Why Use HPC Clusters?
+
+MOSAIC calibrations are **embarrassingly parallel** - each BFRS simulation is independent. HPC clusters allow you to:
+
+- **Scale beyond single-node limits**: Run 1000+ simulations concurrently
+- **Reduce wall-clock time**: 10,000 simulations in 1-2 hours vs 1-2 days
+- **Handle multi-country models**: Large coupled systems (8+ countries) benefit most
+
+## Architecture: Multi-Country Compatibility
+
+**Critical**: Multi-country coupling happens WITHIN each simulation, not between simulations. Each HPC worker runs the entire coupled metapopulation system independently.
+
+```
+Worker 1: LASER([ETH ↔ KEN ↔ SOM ↔ UGA]) → results₁  (independent)
+Worker 2: LASER([ETH ↔ KEN ↔ SOM ↔ UGA]) → results₂  (independent)
+Worker 3: LASER([ETH ↔ KEN ↔ SOM ↔ UGA]) → results₃  (independent)
+```
+
+**No inter-worker communication required!** Each worker processes a complete multi-country simulation.
+
+---
+
+# Quick Start
+
+## Prerequisites
+
+1. **HPC cluster access** with Slurm scheduler
+2. **R packages**:
+   ```r
+   install.packages(c("future.batchtools", "future.apply"))
+   ```
+3. **MOSAIC installation**: See main README
+4. **Shared filesystem**: All nodes must access same data directory
+
+## Basic Example: Slurm Cluster
+
+```{r basic-slurm}
+library(MOSAIC)
+
+# Set root directory (shared filesystem)
+set_root_directory("~/MOSAIC")
+
+# Multi-country config (East Africa)
+iso_codes <- c("ETH", "KEN", "SOM", "UGA", "TZA", "SDN", "SSD", "RWA")
+config <- get_location_config(iso = iso_codes)
+priors <- get_location_priors(iso = iso_codes)
+
+# Configure for Slurm HPC
+control <- mosaic_control_defaults(
+  calibration = list(
+    n_simulations = 10000,  # 10,000 independent simulations
+    n_iterations = 3
+  ),
+  parallel = list(
+    enable = TRUE,
+    type = "future",        # Use future.batchtools backend
+    n_cores = 100,          # Launch 100 Slurm jobs
+
+    # Slurm-specific settings
+    backend = "slurm",
+    resources = list(
+      cpus = 1,             # 1 CPU per job (single-threaded)
+      memory = "6GB",       # 6GB for 8-country model
+      walltime = "02:00:00",  # 2 hours max per job
+      partition = "compute"   # Your cluster's partition name
+    )
+  )
+)
+
+# Run calibration (submits 100 Slurm jobs)
+results <- run_MOSAIC(config, priors, "./output", control = control)
+
+# Results written to: ./output/1_bfrs/outputs/simulations.parquet
+```
+
+**What happens**:
+1. MOSAIC creates 100 Slurm job scripts from the template
+2. Each job runs ~100 simulations (10,000 ÷ 100 workers)
+3. Results written to shared filesystem
+4. Combined automatically when all jobs complete
+5. Total time: ~1-2 hours (vs 20+ hours single-node)
+
+---
+
+# Configuration Options
+
+## Slurm Resource Settings
+
+```{r slurm-detailed}
+control <- mosaic_control_defaults(
+  parallel = list(
+    enable = TRUE,
+    type = "future",
+    n_cores = 200,
+    backend = "slurm",
+    resources = list(
+      nodes = 1,
+      cpus = 1,
+      memory = "4GB",
+      walltime = "04:00:00",
+      partition = "compute",     # Required: your partition name
+      account = "proj_cholera"   # Optional: project/account
+    )
+  )
+)
+```
+
+### Resource Parameters
+
+- **nodes**: Number of nodes per job (default: 1, recommended)
+- **cpus**: CPUs per job (default: 1, single-threaded optimal)
+- **memory**: Memory per job (e.g., "4GB", "8GB")
+- **walltime**: Max runtime (e.g., "04:00:00" for 4 hours)
+- **partition**: Slurm partition name (check with `sinfo`)
+- **account**: Slurm account/project (optional, check with `sacctmgr show user $USER`)
+
+## Custom Slurm Template
+
+```{r slurm-custom-template}
+# Copy package template as starting point
+template_src <- system.file("templates/slurm.tmpl", package = "MOSAIC")
+template_dst <- "~/my_slurm_template.tmpl"
+file.copy(template_src, template_dst)
+
+# Edit template to add:
+# - Module loads: module load R/4.3.0
+# - Environment variables: export MY_VAR=value
+# - Pre-run scripts: source /path/to/setup.sh
+
+# Use custom template
+control$parallel$template <- template_dst
+```
+
+## Container Deployment
+
+For zero-setup deployment, use Singularity/Apptainer containers:
+
+```{r container-example}
+# Use container template
+control$parallel$template <- system.file("templates/slurm-container.tmpl",
+                                         package = "MOSAIC")
+
+# Specify container image path
+control$parallel$resources$container_image <- "~/containers/mosaic_latest.sif"
+
+# Run - no cluster setup required!
+results <- run_MOSAIC(config, priors, "./output", control = control)
+```
+
+See `docs/CONTAINER_DEPLOYMENT.md` for complete container guide.
+
+---
+
+# Resource Planning
+
+## Memory Requirements by Model Size
+
+| Model | Countries | Memory per Worker | Example |
+|-------|-----------|-------------------|---------|
+| Small | 1-2 | 2-3 GB | Ethiopia only |
+| Medium | 3-5 | 4-6 GB | East Africa (5 countries) |
+| Large | 6-10 | 6-10 GB | East Africa + Horn (8 countries) |
+| XLarge | 11-40 | 15-40 GB | Full Sub-Saharan Africa |
+
+**Rule of thumb**: ~1 GB baseline + ~0.5 GB per additional country
+
+## Compute Time Estimates
+
+```{r time-estimates}
+# Single simulation time (approximate)
+# - 1 country: 10-20 seconds
+# - 5 countries: 30-60 seconds
+# - 8 countries: 60-120 seconds
+# - 20 countries: 3-5 minutes
+
+# Total calibration time calculation
+n_simulations <- 10000
+n_iterations <- 3
+time_per_sim <- 60  # seconds (8-country model)
+n_workers <- 100
+
+total_time_seconds <- (n_simulations * n_iterations * time_per_sim) / n_workers
+total_time_hours <- total_time_seconds / 3600
+
+print(paste("Estimated time:", round(total_time_hours, 1), "hours"))
+# Output: "Estimated time: 5 hours"
+```
+
+**Add 20% buffer** for:
+- Queue wait time
+- File I/O overhead
+- Stragglers (slower nodes)
+
+## Optimal Worker Count
+
+```{r optimal-workers}
+# Too few workers: Slow wall-clock time
+# Too many workers: Queue congestion, overhead
+
+# Good starting points:
+# - Small cluster (<100 nodes): 50-100 workers
+# - Medium cluster (100-500 nodes): 100-300 workers
+# - Large cluster (>500 nodes): 200-500 workers
+
+# Check cluster limits
+system("sinfo -o '%P %l %c %m'")  # Slurm: partition info
+```
+
+---
+
+# Advanced Configuration
+
+## Single-Node vs Multi-Node Per Job
+
+MOSAIC supports two strategies:
+
+### Strategy 1: Single-Node Jobs (Recommended)
+
+```{r single-node-strategy}
+# Each job uses 1 node × 1 CPU
+# Simple, reliable, standard approach
+
+control$parallel$resources$nodes <- 1
+control$parallel$resources$cpus <- 1
+```
+
+**Pros**: Simple, portable, efficient for embarrassingly parallel tasks
+**Cons**: None for MOSAIC workloads
+
+### Strategy 2: Multi-Node Jobs (Not Recommended)
+
+```{r multi-node-strategy}
+# Each job uses multiple nodes
+# Requires MPI configuration (complex, not recommended)
+
+control$parallel$resources$nodes <- 4
+control$parallel$resources$cpus <- 120  # 120 CPUs × 4 nodes = 480 total
+```
+
+**Not recommended for MOSAIC**: Each simulation is independent. Multi-node jobs add complexity without performance benefit.
+
+## Progress Monitoring
+
+### Check Job Status
+
+```bash
+# Slurm
+squeue -u $USER -o "%.18i %.9P %.50j %.8T %.10M %.6D"
+```
+
+### View Job Logs
+
+```{r view-logs}
+# Logs written to: ~/.batchtools.logs/
+list.files("~/.batchtools.logs/", pattern = "MOSAIC")
+
+# View recent log
+log_files <- list.files("~/.batchtools.logs/",
+                        pattern = "MOSAIC.*\\.log$",
+                        full.names = TRUE)
+latest_log <- tail(sort(log_files), 1)
+cat(readLines(latest_log, n = 50), sep = "\n")
+```
+
+### Monitor Progress Programmatically
+
+```{r monitor-progress}
+# Check how many simulations completed
+output_dir <- "./output/1_bfrs/parameters"
+completed_files <- list.files(output_dir, pattern = "^sim_.*\\.parquet$")
+n_completed <- length(completed_files)
+
+cat(sprintf("Completed: %d / %d simulations\n", n_completed, 10000))
+```
+
+---
+
+# Troubleshooting
+
+## Common Issues
+
+### 1. Jobs Fail Immediately
+
+**Symptom**: All jobs exit with error before running
+
+**Causes**:
+- Python environment not found
+- MOSAIC package not installed on compute nodes
+- Shared filesystem not accessible
+
+**Solution**:
+```bash
+# Test on compute node
+srun --partition=compute --pty bash
+source ~/miniforge3/etc/profile.d/conda.sh
+conda activate mosaic-conda-env
+Rscript -e 'library(MOSAIC); MOSAIC::check_dependencies()'
+```
+
+### 2. "Cannot allocate memory" Errors
+
+**Symptom**: Jobs killed with OOM (Out Of Memory)
+
+**Solution**: Increase memory allocation
+```{r increase-memory}
+control$parallel$resources$memory <- "8GB"  # was 4GB
+```
+
+### 3. Jobs Timeout
+
+**Symptom**: Jobs hit walltime limit before completing
+
+**Solution**: Increase walltime OR reduce simulations per worker
+```{r fix-timeout}
+control$parallel$resources$walltime <- "12:00:00"  # was 4 hours
+# OR
+control$parallel$n_cores <- 200  # was 100 (fewer sims per worker)
+```
+
+### 4. Disk Quota Exceeded
+
+**Symptom**: "No space left on device"
+
+**Solution**: Use compressed output format
+```{r compress-output}
+control$io$compression <- "zstd"
+control$io$compression_level <- 9L  # Maximum compression
+```
+
+### 5. Python Module Not Found
+
+**Symptom**: "ModuleNotFoundError: No module named 'laser_cholera'"
+
+**Solution**: Ensure conda environment activation in template
+```bash
+# In custom template, add:
+source ~/miniforge3/etc/profile.d/conda.sh
+conda activate mosaic-conda-env
+```
+
+**Alternative**: Use container deployment (no conda needed!)
+
+---
+
+# Performance Optimization
+
+## Threading Configuration
+
+**Critical**: Each worker MUST use single-threaded operations to prevent over-subscription.
+
+This is handled automatically by MOSAIC templates, but verify with:
+
+```bash
+# In job logs, should see:
+# OMP_NUM_THREADS=1
+# MKL_NUM_THREADS=1
+# NUMBA_NUM_THREADS=1
+```
+
+## File I/O Optimization
+
+For large calibrations (>50,000 simulations):
+
+```{r optimize-io}
+control$io <- list(
+  format = "parquet",         # Binary format (10x faster than CSV)
+  compression = "zstd",       # Fast compression
+  compression_level = 3L,     # Balance speed vs size
+  load_method = "streaming"   # Memory-safe loading
+)
+```
+
+## Node Selection
+
+Request high-memory nodes for multi-country models:
+
+```bash
+# Slurm: constrain to high-mem nodes
+#SBATCH --constraint=highmem
+
+# Or specify memory explicitly
+#SBATCH --mem=64GB
+```
+
+---
+
+# Example: Full Production Workflow
+
+## Step 1: Setup
+
+```{r production-setup}
+library(MOSAIC)
+
+# Set root on shared filesystem
+set_root_directory("/shared/cholera/MOSAIC")
+
+# Output directory (will be created)
+output_dir <- "/shared/cholera/calibrations/ETH_KEN_2024"
+```
+
+## Step 2: Configure
+
+```{r production-config}
+# Multi-country East Africa
+iso_codes <- c("ETH", "KEN", "SOM", "UGA", "TZA", "SDN", "SSD", "RWA")
+config <- get_location_config(iso = iso_codes)
+priors <- get_location_priors(iso = iso_codes)
+
+# Production control settings
+control <- mosaic_control_defaults(
+  calibration = list(
+    n_simulations = 50000,      # Large calibration
+    n_iterations = 5,           # High stochasticity
+    batch_size = 5000,
+    max_simulations = 100000
+  ),
+  parallel = list(
+    enable = TRUE,
+    type = "future",
+    n_cores = 500,              # 500 Slurm jobs
+    backend = "slurm",
+    resources = list(
+      cpus = 1,
+      memory = "8GB",
+      walltime = "08:00:00",
+      partition = "compute",
+      account = "proj_cholera"
+    )
+  ),
+  targets = list(
+    ESS_param = 1000,           # High ESS targets
+    ESS_param_prop = 0.99
+  ),
+  npe = list(
+    enable = TRUE,              # Enable NPE for fast posteriors
+    architecture_tier = "large"
+  ),
+  io = list(
+    format = "parquet",
+    compression = "zstd",
+    compression_level = 5L
+  )
+)
+```
+
+## Step 3: Launch
+
+```{r production-launch}
+# Start calibration (returns immediately after submitting jobs)
+results <- run_MOSAIC(config, priors, output_dir, control = control)
+
+# Monitor from login node
+cat("Calibration submitted to cluster.\n")
+cat("Monitor with: squeue -u $USER\n")
+cat("Check progress: ls -lh", output_dir, "/1_bfrs/parameters/ | wc -l\n")
+```
+
+## Step 4: Monitor and Collect
+
+```{bash production-monitor, engine="bash"}
+# Monitor job progress
+watch -n 30 'squeue -u $USER | grep MOSAIC | wc -l'
+
+# When complete, results automatically combined
+# Check final output:
+ls -lh /shared/cholera/calibrations/ETH_KEN_2024/1_bfrs/outputs/simulations.parquet
+```
+
+---
+
+# Best Practices Summary
+
+1. **Test locally first**: Run 100 simulations locally before scaling to HPC
+2. **Start small**: Try 10-50 workers initially, then scale up
+3. **Monitor early**: Check first few jobs complete successfully
+4. **Use compression**: Essential for large calibrations
+5. **Plan resources**: Memory = ~1GB + 0.5GB × n_countries
+6. **Set walltime generously**: Add 50% buffer for queue delays
+7. **Use shared filesystem**: All nodes must access same data
+8. **Single-threaded workers**: Already configured in templates
+9. **Check cluster limits**: Don't exceed max concurrent jobs
+10. **Consider containers**: Zero-setup deployment option
+
+---
+
+# Additional Resources
+
+- **Quick Start**: `docs/SLURM_DEPLOYMENT.md`
+- **Container Guide**: `docs/CONTAINER_DEPLOYMENT.md`
+- **Implementation Details**: `docs/future_batchtools_implementation.md`
+- **MOSAIC documentation**: https://institutefordiseasemodeling.github.io/MOSAIC-docs/
+- **future.batchtools guide**: https://future.batchtools.futureverse.org/
+- **Multi-country architecture**: `docs/multi_country_coupling_analysis.md`
+
+---
+
+# Session Info
+
+```{r session-info}
+sessionInfo()
+```

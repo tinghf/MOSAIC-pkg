@@ -260,7 +260,7 @@
 
 #' Log Cluster Metadata
 #'
-#' Captures SLURM/PBS job metadata for debugging.
+#' Captures Slurm job metadata for debugging.
 #'
 #' @return Named list of cluster metadata
 #' @noRd
@@ -273,24 +273,12 @@
     timestamp = Sys.time()
   )
 
-  # SLURM environment
+  # Slurm environment variables
   slurm_vars <- c(
     "SLURM_JOB_ID", "SLURM_JOB_NAME", "SLURM_NODELIST",
     "SLURM_NTASKS", "SLURM_CPUS_PER_TASK", "SLURM_MEM_PER_NODE"
   )
   for (var in slurm_vars) {
-    val <- Sys.getenv(var)
-    if (val != "") {
-      metadata[[tolower(var)]] <- val
-    }
-  }
-
-  # PBS environment
-  pbs_vars <- c(
-    "PBS_JOBID", "PBS_JOBNAME", "PBS_NODEFILE",
-    "PBS_NP", "PBS_NUM_NODES"
-  )
-  for (var in pbs_vars) {
     val <- Sys.getenv(var)
     if (val != "") {
       metadata[[tolower(var)]] <- val

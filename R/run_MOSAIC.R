@@ -625,7 +625,6 @@ run_MOSAIC <- function(config,
 
   # Only create cluster if n_cores > 1
   if (control$parallel$n_cores > 1L) {
-    log_msg("Setting up %s cluster with %d cores", control$parallel$type, control$parallel$n_cores)
 
     # CRITICAL: Set threading environment variables to prevent fork issues
     # Numba (used by laser-cholera) and TBB can cause threading conflicts when forking
@@ -638,22 +637,69 @@ run_MOSAIC <- function(config,
       OPENBLAS_NUM_THREADS = "1"
     )
 
-    cl <- parallel::makeCluster(control$parallel$n_cores, type = control$parallel$type)
+    # Check if using future.batchtools backend
+    if (control$parallel$type == "future") {
+      # =====================================================================
+      # FUTURE.BATCHTOOLS BACKEND (HPC CLUSTERS)
+      # =====================================================================
 
-    # Register cleanup handler (will be called on normal exit or error)
-    on.exit({
-      if (!is.null(cl)) {
-        try({
-          parallel::stopCluster(cl)
-          log_msg("Cluster stopped successfully")
-        }, silent = TRUE)
+      log_msg("Setting up future.batchtools backend: %s", control$parallel$backend)
+      log_msg("  Workers: %d", control$parallel$n_cores)
+
+      # Validate configuration
+      config_issues <- .mosaic_validate_future_config(
+        backend = control$parallel$backend,
+        workers = control$parallel$n_cores,
+        resources = control$parallel$resources
+      )
+
+      if (!is.null(config_issues)) {
+        for (issue in config_issues) {
+          if (grepl("^Warning:", issue)) {
+            log_msg(issue)
+          } else {
+            stop(issue, call. = FALSE)
+          }
+        }
       }
-    }, add = TRUE)
 
-    .root_dir_val <- root_dir
-    parallel::clusterExport(cl, varlist = c(".root_dir_val"), envir = environment())
+      # Setup future plan
+      .mosaic_setup_future_backend(
+        backend = control$parallel$backend,
+        workers = control$parallel$n_cores,
+        template = control$parallel$template,
+        resources = control$parallel$resources,
+        verbose = TRUE
+      )
 
-    parallel::clusterEvalQ(cl, {
+      # Set cl to NULL (future doesn't use cluster objects)
+      cl <- NULL
+      use_future <- TRUE
+
+    } else {
+      # =====================================================================
+      # TRADITIONAL PARALLEL BACKEND (PSOCK/FORK)
+      # =====================================================================
+
+      log_msg("Setting up %s cluster with %d cores", control$parallel$type, control$parallel$n_cores)
+
+      cl <- parallel::makeCluster(control$parallel$n_cores, type = control$parallel$type)
+      use_future <- FALSE
+
+      # Register cleanup handler for parallel cluster
+      on.exit({
+        if (!is.null(cl)) {
+          try({
+            parallel::stopCluster(cl)
+            log_msg("Cluster stopped successfully")
+          }, silent = TRUE)
+        }
+      }, add = TRUE)
+
+      .root_dir_val <- root_dir
+      parallel::clusterExport(cl, varlist = c(".root_dir_val"), envir = environment())
+
+      parallel::clusterEvalQ(cl, {
       # Set library path for VM user installation
       .libPaths(c('~/R/library', .libPaths()))
 
@@ -692,34 +738,37 @@ run_MOSAIC <- function(config,
       NULL
     })
 
-    parallel::clusterExport(cl,
-      c("n_iterations", "priors", "config", "PATHS", "param_names_all", "sampling_args", "dirs", "control"),
-      envir = environment())
+      parallel::clusterExport(cl,
+        c("n_iterations", "priors", "config", "PATHS", "param_names_all", "sampling_args", "dirs", "control"),
+        envir = environment())
 
-    # Create worker function on each worker using exported variables
-    # This avoids anonymous function closure serialization overhead
-    parallel::clusterCall(cl, function() {
-      assign(".run_sim_worker", function(sim_id) {
-        # Use ::: to access internal function from MOSAIC namespace in PSOCK workers
-        MOSAIC:::.mosaic_run_simulation_worker(
-          sim_id = sim_id,
-          n_iterations = n_iterations,
-          priors = priors,
-          config = config,
-          PATHS = PATHS,
-          dir_bfrs_parameters = dirs$bfrs_params,
-          dir_bfrs_timeseries = if (control$npe$enable) dirs$bfrs_times else NULL,
-          param_names_all = param_names_all,
-          sampling_args = sampling_args,
-          io = control$io,
-          save_timeseries = control$npe$enable
-        )
-      }, envir = .GlobalEnv)
-      NULL
-    })
+      # Create worker function on each worker using exported variables
+      # This avoids anonymous function closure serialization overhead
+      parallel::clusterCall(cl, function() {
+        assign(".run_sim_worker", function(sim_id) {
+          # Use ::: to access internal function from MOSAIC namespace in PSOCK workers
+          MOSAIC:::.mosaic_run_simulation_worker(
+            sim_id = sim_id,
+            n_iterations = n_iterations,
+            priors = priors,
+            config = config,
+            PATHS = PATHS,
+            dir_bfrs_parameters = dirs$bfrs_params,
+            dir_bfrs_timeseries = if (control$npe$enable) dirs$bfrs_times else NULL,
+            param_names_all = param_names_all,
+            sampling_args = sampling_args,
+            io = control$io,
+            save_timeseries = control$npe$enable
+          )
+        }, envir = .GlobalEnv)
+        NULL
+      })
+    }
+
   } else {
     log_msg("Running sequentially (n_cores = 1)")
     cl <- NULL
+    use_future <- FALSE
   }
 
   # ===========================================================================
@@ -781,7 +830,23 @@ run_MOSAIC <- function(config,
       batch_start_time <- Sys.time()
 
       # Use worker function (parallel mode uses pre-defined .run_sim_worker on workers)
-      if (!is.null(cl)) {
+      if (use_future) {
+        # future.batchtools: HPC cluster execution
+        success_indicators <- .mosaic_run_batch_future(
+          sim_ids = sim_ids,
+          worker_func = function(sim_id) {
+            MOSAIC:::.mosaic_run_simulation_worker(
+              sim_id, n_iterations, priors, config, PATHS,
+              dirs$bfrs_params,
+              if (control$npe$enable) dirs$bfrs_times else NULL,
+              param_names_all, sampling_args,
+              io = control$io,
+              save_timeseries = control$npe$enable
+            )
+          },
+          show_progress = control$parallel$progress
+        )
+      } else if (!is.null(cl)) {
         # Parallel: use worker function defined on cluster
         success_indicators <- .mosaic_run_batch(
           sim_ids = sim_ids,
@@ -890,7 +955,23 @@ run_MOSAIC <- function(config,
       batch_start_time <- Sys.time()
 
       # Use worker function (parallel mode uses pre-defined .run_sim_worker on workers)
-      if (!is.null(cl)) {
+      if (use_future) {
+        # future.batchtools: HPC cluster execution
+        success_indicators <- .mosaic_run_batch_future(
+          sim_ids = sim_ids,
+          worker_func = function(sim_id) {
+            MOSAIC:::.mosaic_run_simulation_worker(
+              sim_id, n_iterations, priors, config, PATHS,
+              dirs$bfrs_params,
+              if (control$npe$enable) dirs$bfrs_times else NULL,
+              param_names_all, sampling_args,
+              io = control$io,
+              save_timeseries = control$npe$enable
+            )
+          },
+          show_progress = control$parallel$progress
+        )
+      } else if (!is.null(cl)) {
         # Parallel: use worker function defined on cluster
         success_indicators <- .mosaic_run_batch(
           sim_ids = sim_ids,
@@ -1879,8 +1960,22 @@ mosaic_control_defaults <- function(calibration = NULL,
   default_parallel <- list(
     enable = FALSE,
     n_cores = 1L,
-    type = "PSOCK",
-    progress = TRUE
+    type = "PSOCK",      # "PSOCK", "FORK", or "future"
+    progress = TRUE,
+
+    # future.batchtools backend settings (only used when type = "future")
+    backend = "slurm",   # "local" for testing, "slurm" for HPC cluster
+    template = NULL,     # Path to custom template file (NULL = use package default)
+
+    # Slurm resource settings (only used when backend = "slurm")
+    resources = list(
+      nodes = 1L,
+      cpus = 1L,
+      memory = "4GB",
+      walltime = "24:00:00",
+      partition = NULL,   # Slurm partition (e.g., "compute", "gpu")
+      account = NULL      # Slurm account/project (optional)
+    )
   )
 
   # Default path settings

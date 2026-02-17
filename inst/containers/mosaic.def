@@ -1,0 +1,117 @@
+Bootstrap: docker
+From: condaforge/miniforge3:latest
+
+%help
+    MOSAIC (Metapopulation Outbreak Simulation with Agent-based Implementation for Cholera)
+    Container image with all R and Python dependencies pre-installed.
+
+    Usage:
+      singularity exec mosaic.sif Rscript your_script.R
+      singularity exec mosaic.sif R
+
+    Built from: https://github.com/InstituteforDiseaseModeling/MOSAIC-pkg
+
+%labels
+    Author Institute for Disease Modeling
+    Version 0.14.0
+    Description MOSAIC cholera transmission model with BFRS calibration
+
+%files
+    # Copy MOSAIC package source into container
+    # Assumes you build from MOSAIC-pkg parent directory
+    ./MOSAIC-pkg /opt/MOSAIC-pkg
+
+%environment
+    # Conda environment
+    export PATH=/opt/conda/envs/mosaic-conda-env/bin:$PATH
+    export CONDA_DEFAULT_ENV=mosaic-conda-env
+
+    # Threading limits (critical for HPC performance)
+    export OMP_NUM_THREADS=1
+    export MKL_NUM_THREADS=1
+    export NUMBA_NUM_THREADS=1
+    export TBB_NUM_THREADS=1
+    export OPENBLAS_NUM_THREADS=1
+    export BLIS_NUM_THREADS=1
+    export R_DATATABLE_NUM_THREADS=1
+    export OMP_DYNAMIC=FALSE
+
+    # R library path (for packages installed in container)
+    export R_LIBS_SITE=/usr/local/lib/R/site-library
+
+    # Prevent Python from writing bytecode (cleaner filesystem)
+    export PYTHONDONTWRITEBYTECODE=1
+
+%post
+    # Update base system
+    apt-get update && apt-get install -y \
+        build-essential \
+        git \
+        wget \
+        curl \
+        ca-certificates \
+        libgdal-dev \
+        libgeos-dev \
+        libproj-dev \
+        libudunits2-dev \
+        libcurl4-openssl-dev \
+        libssl-dev \
+        libxml2-dev \
+        libfontconfig1-dev \
+        libharfbuzz-dev \
+        libfribidi-dev \
+        libfreetype6-dev \
+        libpng-dev \
+        libtiff5-dev \
+        libjpeg-dev \
+        && rm -rf /var/lib/apt/lists/*
+
+    # Install R (latest version from CRAN)
+    apt-get update && apt-get install -y \
+        r-base \
+        r-base-dev \
+        && rm -rf /var/lib/apt/lists/*
+
+    # Create conda environment with Python dependencies
+    cd /opt/MOSAIC-pkg
+    conda env create -f inst/py/environment.yml
+
+    # Initialize conda for shell
+    conda init bash
+
+    # Activate environment and install MOSAIC R package
+    . /opt/conda/etc/profile.d/conda.sh
+    conda activate mosaic-conda-env
+
+    # Install R package dependencies
+    Rscript -e "install.packages('remotes', repos='https://cloud.r-project.org')"
+    Rscript -e "remotes::install_deps('/opt/MOSAIC-pkg', dependencies=TRUE, repos='https://cloud.r-project.org')"
+
+    # Install future.batchtools for HPC support
+    Rscript -e "install.packages(c('future', 'future.batchtools', 'future.apply', 'progressr'), repos='https://cloud.r-project.org')"
+
+    # Install MOSAIC package
+    R CMD INSTALL /opt/MOSAIC-pkg
+
+    # Verify installation
+    Rscript -e "library(MOSAIC); MOSAIC::check_dependencies()"
+
+    # Clean up to reduce image size
+    conda clean -afy
+    apt-get clean
+    rm -rf /tmp/*
+
+%runscript
+    # Default: Start R interactive session with MOSAIC loaded
+    echo "Starting R with MOSAIC..."
+    R --no-save
+
+%startscript
+    # For instance mode (not typically used for MOSAIC)
+    echo "MOSAIC container started"
+
+%test
+    # Test that MOSAIC loads correctly
+    Rscript -e "library(MOSAIC); print('✓ MOSAIC loaded successfully')"
+    Rscript -e "library(future.batchtools); print('✓ future.batchtools available')"
+    python -c "import laser_cholera; print('✓ laser-cholera available')"
