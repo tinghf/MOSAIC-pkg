@@ -1,0 +1,36 @@
+{
+  "$schema": "https://schema.management.azure.com/schemas/2019-04-01/deploymentParameters.json#",
+  "contentVersion": "1.0.0.0",
+  "parameters": {
+    "vmName": {
+      "value": "mosaic-vm-001"
+    },
+    "vmSize": {
+      "value": "Standard_HB120rs_v3"
+    },
+    "adminUsername": {
+      "value": "mosaicuser"
+    },
+    "sshPublicKey": {
+      "value": "ssh-rsa AAAAB3NzaC1... YOUR_SSH_PUBLIC_KEY_HERE"
+    },
+    "imageResourceGroup": {
+      "value": "mosaic-images-rg"
+    },
+    "imageName": {
+      "value": "mosaic-ubuntu2004"
+    },
+    "enableRStudio": {
+      "value": true
+    },
+    "enableAutoShutdown": {
+      "value": true
+    },
+    "shutdownTime": {
+      "value": "0200"
+    },
+    "shutdownTimezone": {
+      "value": "Pacific Standard Time"
+    }
+  }
+}
