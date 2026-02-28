@@ -1,0 +1,59 @@
+name: mosaic-pkg
+channels:
+  - conda-forge
+dependencies:
+  # Python
+  - python=3.11
+
+  # R and R packages
+  - r-base=4.3  # Latest R version
+  - r-essentials
+  - r-reticulate
+  - r-remotes
+  - r-devtools
+
+  # Critical R packages (must pre-install to avoid compilation failures)
+  - r-sf  # Spatial features
+  - r-s2  # Spherical geometry
+  - r-units  # Units of measurement
+  - r-arrow  # Arrow/Parquet (requires C++20)
+  - r-exactextractr=0.10.0  # Specify version available for R 4.3
+  - r-ggrepel  # Plot labels (common dependency)
+  - r-hdf5r  # HDF5 interface (compilation issue)
+  - r-fnn  # Fast nearest neighbors
+  - r-gtools  # Various R tools
+  - r-minpack.lm  # Levenberg-Marquardt
+  - r-pbapply  # Progress bar apply
+  - r-patchwork  # Plot layout
+
+  # Geospatial dependencies (let R packages determine versions)
+  # Removed explicit gdal/proj/geos to avoid version conflicts with R packages
+
+  # Python packages for Dask and Coiled
+  - dask
+  - distributed
+  - numpy=1.24.*
+  - pandas
+  - pyarrow
+
+  # MOSAIC Python dependencies (from inst/py/environment.yml)
+  - numba=0.58.*
+  - llvmlite=0.41.*
+  - pytorch::pytorch=2.1.*
+  - scikit-learn=1.3.*
+
+  # Additional utilities
+  - pip
+  - git
+  - curl
+  - wget
+
+  # Pip packages
+  - pip:
+      - coiled
+      # MOSAIC Python dependencies (from inst/py/environment.yml)
+      - sbi==0.22.0
+      - lampe==0.9.0
+      - zuko==1.3.0
+      - laser-core==0.4.0
+      - https://github.com/InstituteforDiseaseModeling/laser-cholera/releases/download/v0.9.1/laser_cholera-0.9.1-py3-none-any.whl

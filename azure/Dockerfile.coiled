@@ -1,0 +1,63 @@
+FROM condaforge/mambaforge:latest
+
+# Install system dependencies
+RUN apt-get update && apt-get install -y \
+    git \
+    curl \
+    wget \
+    build-essential \
+    gdal-bin libgdal-dev \
+    libproj-dev proj-bin \
+    libgeos-dev \
+    libudunits2-dev \
+    libcurl4-openssl-dev \
+    libssl-dev \
+    && rm -rf /var/lib/apt/lists/*
+
+# Create conda environment with R + Python
+RUN mamba create -n mosaic-env -c conda-forge -y \
+    python=3.11 \
+    r-base=4.3 \
+    r-essentials \
+    r-reticulate \
+    r-remotes \
+    r-devtools \
+    gdal \
+    proj \
+    geos \
+    hdf5 \
+    dask \
+    distributed \
+    numpy=1.24.* \
+    pandas \
+    pyarrow \
+    pip \
+    && mamba clean -a -y
+
+# Activate environment by default
+ENV PATH=/opt/conda/envs/mosaic-env/bin:$PATH
+SHELL ["conda", "run", "-n", "mosaic-env", "/bin/bash", "-c"]
+
+# Install MOSAIC R package from GitHub
+RUN Rscript -e " \
+    options(repos = c(CRAN = 'https://cloud.r-project.org')); \
+    dir.create('~/R/library', recursive=TRUE, showWarnings=FALSE); \
+    .libPaths(c('~/R/library', .libPaths())); \
+    remotes::install_github('InstituteforDiseaseModeling/MOSAIC-pkg', dependencies=TRUE, upgrade='never'); \
+    "
+
+# Install MOSAIC Python dependencies
+RUN Rscript -e " \
+    library(MOSAIC); \
+    MOSAIC::install_dependencies(force=TRUE); \
+    MOSAIC::check_dependencies(); \
+    "
+
+# Install additional Python packages
+RUN pip install --no-cache-dir coiled
+
+# Set working directory
+WORKDIR /workspace
+
+# Default command
+CMD ["/bin/bash"]

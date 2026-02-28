@@ -1,0 +1,36 @@
+# Azure deployment artifacts
+*.log
+*.tar.gz
+
+# Terraform state (if using Terraform in future)
+.terraform/
+*.tfstate
+*.tfstate.backup
+
+# Local parameter overrides
+parameters.local.json
+secrets.json
+
+# Container build artifacts
+.dockerignore
+
+# Batch temporary files
+/batch/*.pyc
+/batch/__pycache__/
+
+# Test outputs
+/output/
+/test-output/
+*.parquet
+
+# Coiled credentials (should use environment variables instead)
+.coiled/
+
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+
+# OS files
+.DS_Store
+Thumbs.db
