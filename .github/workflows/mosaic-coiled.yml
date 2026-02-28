@@ -1,0 +1,208 @@
+name: MOSAIC Coiled Dispatch
+
+on:
+  workflow_dispatch:
+    inputs:
+      iso_codes:
+        description: 'ISO country codes (comma-separated)'
+        required: true
+        default: 'ETH'
+      n_simulations:
+        description: 'Simulations per iteration'
+        required: true
+        default: '1000'
+        type: number
+      n_iterations:
+        description: 'Number of BFRS iterations'
+        required: true
+        default: '3'
+        type: choice
+        options:
+          - '1'
+          - '2'
+          - '3'
+          - '5'
+          - '10'
+      n_workers:
+        description: 'Number of Coiled workers'
+        required: true
+        default: '10'
+        type: number
+  push:
+    branches:
+      - main
+    paths:
+      - 'azure/**'
+      - 'R/run_MOSAIC.R'
+      - 'R/run_LASER.R'
+
+permissions:
+  contents: read
+  actions: write
+
+jobs:
+  run-mosaic:
+    name: Run MOSAIC on Coiled
+    runs-on: ubuntu-latest
+    timeout-minutes: 480  # 8 hours max
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+
+      - name: Install Python dependencies
+        run: |
+          pip install --upgrade pip
+          pip install coiled dask distributed pandas pyarrow
+
+      - name: Configure Coiled
+        env:
+          COILED_TOKEN: ${{ secrets.COILED_TOKEN }}
+        run: |
+          mkdir -p ~/.coiled
+          echo "$COILED_TOKEN" > ~/.coiled/token
+          chmod 600 ~/.coiled/token
+
+      - name: Verify Coiled connection
+        run: |
+          python -c "import coiled; print('Coiled version:', coiled.__version__)"
+          python -c "import coiled; print('Available clusters:', coiled.list_clusters())"
+
+      - name: Run MOSAIC calibration
+        id: run_mosaic
+        run: |
+          python azure/run_mosaic_coiled.py \
+            --iso ${{ inputs.iso_codes }} \
+            --n-simulations ${{ inputs.n_simulations }} \
+            --n-iterations ${{ inputs.n_iterations }} \
+            --n-workers ${{ inputs.n_workers }} \
+            --output-dir ./output \
+            2>&1 | tee mosaic_run.log
+
+      - name: Compress results
+        if: always()
+        run: |
+          # Create tarball
+          tar -czf output.tar.gz output/ mosaic_run.log
+
+          # Display size
+          ls -lh output.tar.gz
+
+          # Show contents
+          echo "Archive contents:"
+          tar -tzf output.tar.gz | head -20
+
+      - name: Upload results to GitHub Artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: mosaic-results-${{ github.sha }}
+          path: output.tar.gz
+          retention-days: 90
+          compression-level: 0  # Already compressed
+
+      - name: Upload logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: mosaic-logs-${{ github.sha }}
+          path: mosaic_run.log
+          retention-days: 30
+
+      - name: Extract summary metrics
+        id: metrics
+        if: always()
+        run: |
+          if [ -f output/summary.json ]; then
+            cat output/summary.json
+            ESS=$(jq -r '.final_ess' output/summary.json)
+            TOTAL_SIMS=$(jq -r '.total_simulations' output/summary.json)
+            echo "ess=$ESS" >> $GITHUB_OUTPUT
+            echo "total_sims=$TOTAL_SIMS" >> $GITHUB_OUTPUT
+          else
+            echo "No summary file found"
+            echo "ess=N/A" >> $GITHUB_OUTPUT
+            echo "total_sims=N/A" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Post completion summary
+        uses: actions/github-script@v7
+        if: always()
+        with:
+          script: |
+            const fs = require('fs');
+            const success = '${{ job.status }}' === 'success';
+            const emoji = success ? '✅' : '❌';
+            const status = success ? 'Completed Successfully' : 'Failed';
+
+            let summaryTable = [
+              [{data: 'Parameter', header: true}, {data: 'Value', header: true}],
+              ['Status', `${emoji} ${status}`],
+              ['ISO Codes', '${{ inputs.iso_codes }}'],
+              ['Iterations', '${{ inputs.n_iterations }}'],
+              ['Simulations', '${{ inputs.n_simulations }}'],
+              ['Workers', '${{ inputs.n_workers }}'],
+            ];
+
+            if (success && fs.existsSync('output/summary.json')) {
+              const summary = JSON.parse(fs.readFileSync('output/summary.json'));
+              summaryTable.push(['Total Simulations', summary.total_simulations]);
+              summaryTable.push(['Final ESS', Math.round(summary.final_ess)]);
+              summaryTable.push(['Dashboard', `[View](${summary.dashboard_link})`]);
+            }
+
+            await core.summary
+              .addHeading(`${emoji} MOSAIC Coiled Calibration ${status}`)
+              .addTable(summaryTable)
+              .addRaw(`\n**Git SHA**: \`${{ github.sha }}\``)
+              .addRaw(`\n**Run ID**: \`${{ github.run_id }}\``)
+              .write();
+
+      - name: Comment on PR
+        uses: actions/github-script@v7
+        if: github.event_name == 'pull_request' && always()
+        with:
+          script: |
+            const success = '${{ job.status }}' === 'success';
+            const emoji = success ? '✅' : '❌';
+
+            let comment = `## ${emoji} MOSAIC Coiled Calibration\n\n`;
+            comment += `**Status**: ${success ? 'Completed' : 'Failed'}\n`;
+            comment += `**ISO Codes**: ${{ inputs.iso_codes }}\n`;
+            comment += `**Iterations**: ${{ inputs.n_iterations }}\n`;
+            comment += `**Simulations**: ${{ inputs.n_simulations }}\n`;
+            comment += `**Workers**: ${{ inputs.n_workers }}\n\n`;
+
+            if (success) {
+              comment += `✅ Results uploaded to GitHub Artifacts\n`;
+              comment += `📊 Final ESS: ${{ steps.metrics.outputs.ess }}\n`;
+            } else {
+              comment += `❌ Check logs for error details\n`;
+            }
+
+            comment += `\n[View workflow run](https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }})`;
+
+            github.rest.issues.createComment({
+              issue_number: context.issue.number,
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              body: comment
+            });
+
+      - name: Notify on failure
+        if: failure()
+        run: |
+          echo "❌ MOSAIC calibration failed!"
+          echo "Check logs above for error details"
+          echo "Common issues:"
+          echo "  1. Coiled token not configured correctly"
+          echo "  2. Software environment not created (run: coiled env create)"
+          echo "  3. R package installation failed on workers"
+          echo "  4. Insufficient Coiled quota"
+          exit 1
