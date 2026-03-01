@@ -13,3 +13,4 @@ claude/
 *.Rcheck/
 ..Rcheck/
 sbi-logs/
+azure/storage_mount/.env

@@ -1,0 +1,7 @@
+# Azure credentials - DO NOT COMMIT!
+.env
+*.key
+credentials.txt
+
+# Mount points
+/mnt/

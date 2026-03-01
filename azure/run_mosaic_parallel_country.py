@@ -37,54 +37,175 @@ def run_mosaic_for_country(iso_code, output_dir, n_simulations=1000, n_iteration
     This function runs on a Coiled worker.
     """
     import subprocess
+    import tempfile
+    import os
 
+    # Get Azure credentials from environment
+    storage_account = os.environ.get('AZURE_STORAGE_ACCOUNT', 'ttingeasyva')
+    storage_key = os.environ.get('AZURE_STORAGE_KEY', '')
+    container = os.environ.get('AZURE_BLOB_CONTAINER', 'mosaic-data')
+
+    # Create R script as temp file (avoids quoting hell with -e)
     r_script = f"""
-    library(MOSAIC)
-    set_root_directory('/workspace')
+library(MOSAIC)
 
-    # Configure MOSAIC for this country
-    iso_codes <- c("{iso_code}")
-    config <- get_location_config(iso=iso_codes)
-    priors <- get_location_priors(iso=iso_codes)
-    control <- mosaic_control_defaults()
+# Mount Azure Blob Storage with BlobFuse2 (works in unprivileged containers!)
+cat("Mounting Azure Blob Storage with BlobFuse2...\\n")
 
-    control$calibration$n_simulations <- {n_simulations}
-    control$calibration$n_iterations <- {n_iterations}
-    control$parallel$enable <- TRUE
-    control$parallel$n_cores <- parallel::detectCores() - 1
+# Create BlobFuse config
+config_yaml <- sprintf('
+allow-other: true
+logging:
+  type: syslog
+  level: log_warning
+components:
+  - libfuse
+  - file_cache
+  - attr_cache
+  - azstorage
+libfuse:
+  attribute-expiration-sec: 120
+  entry-expiration-sec: 120
+  negative-entry-expiration-sec: 240
+file_cache:
+  path: /tmp/blobfuse-cache
+  timeout-sec: 120
+  max-size-mb: 4096
+attr_cache:
+  timeout-sec: 7200
+azstorage:
+  type: block
+  account-name: {storage_account}
+  account-key: {storage_key}
+  endpoint: https://{storage_account}.blob.core.windows.net
+  mode: key
+  container: {container}
+')
 
-    cat("Starting MOSAIC calibration for {iso_code}...\\n")
-    cat("Simulations:", {n_simulations}, "\\n")
-    cat("Iterations:", {n_iterations}, "\\n")
-    cat("Cores:", parallel::detectCores() - 1, "\\n")
+writeLines(config_yaml, '/tmp/blobfuse-config.yaml')
+cat("  ✓ BlobFuse config created\\n")
 
-    # Run MOSAIC (existing proven workflow!)
+# Mount using BlobFuse2
+system('mkdir -p /workspace/MOSAIC /tmp/blobfuse-cache')
+mount_result <- system('blobfuse2 mount /workspace/MOSAIC --config-file=/tmp/blobfuse-config.yaml 2>&1')
+
+# Verify mount succeeded
+if (!dir.exists('/workspace/MOSAIC/MOSAIC/MOSAIC-data') || !dir.exists('/workspace/MOSAIC/MOSAIC/MOSAIC-pkg')) {{
+    cat("❌ ERROR: Failed to mount blob storage\\n")
+    cat("Mount exit code:", mount_result, "\\n")
+    system('ls -la /workspace/MOSAIC/')
+    quit(status = 1)
+}}
+cat("✅ Blob storage mounted successfully\\n")
+
+# Set MOSAIC root directory to mount point
+set_root_directory('/workspace/MOSAIC/MOSAIC')
+
+# Configure MOSAIC for this country
+iso_codes <- c("{iso_code}")
+
+cat(strrep("=", 70), "\\n")
+cat("MOSAIC Calibration: {iso_code}\\n")
+cat(strrep("=", 70), "\\n")
+cat("Step 1: Getting location config...\\n")
+config <- get_location_config(iso=iso_codes)
+cat("  ✓ Config loaded for:", config$location_name, "\\n")
+
+cat("Step 2: Getting location priors...\\n")
+priors <- get_location_priors(iso=iso_codes)
+cat("  ✓ Priors loaded\\n")
+
+cat("Step 3: Setting up control parameters...\\n")
+control <- mosaic_control_defaults()
+control$calibration$n_simulations <- {n_simulations}
+control$calibration$n_iterations <- {n_iterations}
+control$parallel$enable <- TRUE
+control$parallel$n_cores <- max(1, parallel::detectCores() - 1)
+cat("  ✓ Simulations:", {n_simulations}, "\\n")
+cat("  ✓ Iterations:", {n_iterations}, "\\n")
+cat("  ✓ Cores:", control$parallel$n_cores, "\\n")
+
+cat("Step 4: Creating output directory...\\n")
+dir_output <- file.path('/workspace', 'output', '{iso_code}')
+dir.create(dir_output, recursive = TRUE, showWarnings = FALSE)
+cat("  ✓ Output dir:", dir_output, "\\n")
+
+cat(strrep("=", 70), "\\n")
+cat("Starting MOSAIC calibration...\\n")
+cat(strrep("=", 70), "\\n")
+
+# Run MOSAIC (existing proven workflow!)
+tryCatch({{
     result <- run_MOSAIC(
-        dir_output = "{output_dir}/{iso_code}",
+        dir_output = dir_output,
         config = config,
         priors = priors,
         control = control
     )
-
+    cat("\\n")
+    cat(strrep("=", 70), "\\n")
     cat("✅ MOSAIC calibration complete for {iso_code}!\\n")
-    """
+    cat(strrep("=", 70), "\\n")
+}}, error = function(e) {{
+    cat("\\n")
+    cat(strrep("=", 70), "\\n")
+    cat("❌ ERROR in MOSAIC calibration:\\n")
+    cat(strrep("=", 70), "\\n")
+    cat("Error message:\\n")
+    cat(as.character(e$message), "\\n")
+    cat("\\n")
+    cat("Traceback:\\n")
+    print(sys.calls())
+    quit(status = 1)
+}})
+"""
 
     print(f"[{iso_code}] Running MOSAIC calibration...")
 
-    result = subprocess.run(
-        ['Rscript', '-e', r_script],
-        capture_output=True,
-        text=True,
-        timeout=7200  # 2 hour timeout per country
-    )
+    # Write R script to temp file
+    with tempfile.NamedTemporaryFile(mode='w', suffix='.R', delete=False) as f:
+        f.write(r_script)
+        script_path = f.name
 
-    if result.returncode == 0:
-        print(f"[{iso_code}] ✅ Complete!")
-        return {'country': iso_code, 'status': 'success'}
-    else:
-        print(f"[{iso_code}] ❌ Failed")
-        print(f"Stderr: {result.stderr}")
-        return {'country': iso_code, 'status': 'failed', 'error': result.stderr}
+    try:
+        # Run R script from file (much cleaner than -e!)
+        result = subprocess.run(
+            ['Rscript', script_path],
+            capture_output=True,
+            text=True,
+            timeout=7200  # 2 hour timeout per country
+        )
+
+        # Print stdout for visibility
+        if result.stdout:
+            print(f"[{iso_code}] Output:")
+            for line in result.stdout.split('\n'):
+                if line.strip():
+                    print(f"  {line}")
+
+        if result.returncode == 0:
+            print(f"[{iso_code}] ✅ Complete!")
+            return {'country': iso_code, 'status': 'success', 'output': result.stdout}
+        else:
+            print(f"[{iso_code}] ❌ Failed (exit code {result.returncode})")
+            if result.stderr:
+                print(f"[{iso_code}] Error output:")
+                for line in result.stderr.split('\n')[:50]:  # Limit error output
+                    if line.strip():
+                        print(f"  {line}")
+            return {
+                'country': iso_code,
+                'status': 'failed',
+                'error': result.stderr,
+                'output': result.stdout,
+                'exit_code': result.returncode
+            }
+    finally:
+        # Cleanup temp file
+        try:
+            os.unlink(script_path)
+        except:
+            pass
 
 def main():
     parser = argparse.ArgumentParser(
@@ -101,6 +222,15 @@ def main():
     args = parser.parse_args()
     iso_codes = [x.strip().upper() for x in args.iso.split(',')]
 
+    # Get Azure credentials from environment
+    import os
+    storage_key = os.environ.get('AZURE_STORAGE_KEY')
+    if not storage_key:
+        print("❌ ERROR: AZURE_STORAGE_KEY environment variable not set")
+        print("   Run: source azure/storage_mount/.env")
+        print("   Or:  export AZURE_STORAGE_KEY=<your-key>")
+        sys.exit(1)
+
     print("="*70)
     print("MOSAIC on Coiled - Parallel Country Execution")
     print("="*70)
@@ -109,6 +239,7 @@ def main():
     print(f"Iterations per country: {args.n_iterations}")
     print(f"VM type: {args.vm_type}")
     print(f"Output: {args.output_dir}")
+    print(f"Data source: Azure Blob (ttingeasyva/mosaic-data via BlobFuse2)")
     print("="*70)
     print()
 
@@ -129,7 +260,12 @@ def main():
         region=args.region,
         software=args.coiled_env,
         shutdown_on_close=True,
-        idle_timeout="3 hours"
+        idle_timeout="3 hours",
+        environ={
+            'AZURE_STORAGE_ACCOUNT': os.environ.get('AZURE_STORAGE_ACCOUNT', 'ttingeasyva'),
+            'AZURE_STORAGE_KEY': storage_key,
+            'AZURE_BLOB_CONTAINER': os.environ.get('AZURE_BLOB_CONTAINER', 'mosaic-data')
+        }
     )
 
     client = Client(cluster)
@@ -166,7 +302,7 @@ def main():
         status_icon = "✅" if result['status'] == 'success' else "❌"
         print(f"{status_icon} {result['country']}: {result['status']}")
         if result['status'] == 'failed' and 'error' in result:
-            print(f"   Error: {result['error'][:1000]}")
+            print(f"   Error: {result['error'][:10000]}")
 
     print("="*70)
 

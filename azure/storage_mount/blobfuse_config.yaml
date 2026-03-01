@@ -1,0 +1,35 @@
+# BlobFuse2 configuration for MOSAIC data
+# This file template will be populated with actual credentials at runtime
+
+allow-other: true
+
+logging:
+  type: syslog
+  level: log_warning
+
+components:
+  - libfuse
+  - file_cache
+  - attr_cache
+  - azstorage
+
+libfuse:
+  attribute-expiration-sec: 120
+  entry-expiration-sec: 120
+  negative-entry-expiration-sec: 240
+
+file_cache:
+  path: /tmp/blobfuse-cache
+  timeout-sec: 120
+  max-size-mb: 4096
+
+attr_cache:
+  timeout-sec: 7200
+
+azstorage:
+  type: block
+  account-name: PLACEHOLDER_ACCOUNT
+  account-key: PLACEHOLDER_KEY
+  endpoint: https://PLACEHOLDER_ACCOUNT.blob.core.windows.net
+  mode: key
+  container: PLACEHOLDER_CONTAINER

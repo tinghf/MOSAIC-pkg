@@ -92,7 +92,8 @@ RUN R -e "options(repos = c(CRAN = 'https://cloud.r-project.org')); \
         'cowplot', \
         'furrr', \
         'slider', \
-        'RhpcBLASctl' \
+        'RhpcBLASctl', \
+        'truncnorm' \
     )); \
     # Install older ggrepel compatible with R 4.4 \
     remotes::install_version('ggrepel', version = '0.9.5', repos = 'https://cloud.r-project.org'); \
@@ -144,6 +145,17 @@ RUN R -e "library(MOSAIC); \
     if (!result) quit(status = 1)"
 
 # ============================================================
+# Install BlobFuse2 for Azure Blob Storage mounting
+# ============================================================
+# BlobFuse2 allows mounting Azure Blob Storage in unprivileged containers
+RUN wget https://packages.microsoft.com/config/ubuntu/24.04/packages-microsoft-prod.deb && \
+    dpkg -i packages-microsoft-prod.deb && \
+    apt-get update && \
+    apt-get install -y blobfuse2 fuse3 && \
+    rm -rf /var/lib/apt/lists/* packages-microsoft-prod.deb && \
+    echo "✓ BlobFuse2 installed"
+
+# ============================================================
 # Setup for Coiled workers
 # ============================================================
 # Add r-mosaic conda environment to PATH so Coiled can find Python/dask
@@ -151,10 +163,12 @@ ENV PATH=/root/.virtualenvs/r-mosaic/bin:$PATH
 
 WORKDIR /workspace
 
-# Create directories for MOSAIC workflows
-RUN mkdir -p /workspace/model/input && \
-    mkdir -p /workspace/model/output && \
-    mkdir -p /workspace/data
+# Create directories for MOSAIC workflows and BlobFuse cache
+RUN mkdir -p /workspace/MOSAIC \
+             /workspace/model/input \
+             /workspace/model/output \
+             /workspace/data \
+             /tmp/blobfuse-cache
 
 # Default command for Coiled workers
 CMD ["/bin/bash"]
