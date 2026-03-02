@@ -40,66 +40,31 @@ def run_mosaic_for_country(iso_code, output_dir, n_simulations=1000, n_iteration
     import tempfile
     import os
 
-    # Get Azure credentials from environment
-    storage_account = os.environ.get('AZURE_STORAGE_ACCOUNT', 'ttingeasyva')
-    storage_key = os.environ.get('AZURE_STORAGE_KEY', '')
-    container = os.environ.get('AZURE_BLOB_CONTAINER', 'mosaic-data')
-
     # Create R script as temp file (avoids quoting hell with -e)
     r_script = f"""
 library(MOSAIC)
 
-# Mount Azure Blob Storage with BlobFuse2 (works in unprivileged containers!)
-cat("Mounting Azure Blob Storage with BlobFuse2...\\n")
+# Attach Python environment (CRITICAL for LASER simulations!)
+cat("Attaching MOSAIC Python environment...\\n")
+MOSAIC::use_mosaic_env()
+cat("✅ Python environment attached\\n")
 
-# Create BlobFuse config
-config_yaml <- sprintf('
-allow-other: true
-logging:
-  type: syslog
-  level: log_warning
-components:
-  - libfuse
-  - file_cache
-  - attr_cache
-  - azstorage
-libfuse:
-  attribute-expiration-sec: 120
-  entry-expiration-sec: 120
-  negative-entry-expiration-sec: 240
-file_cache:
-  path: /tmp/blobfuse-cache
-  timeout-sec: 120
-  max-size-mb: 4096
-attr_cache:
-  timeout-sec: 7200
-azstorage:
-  type: block
-  account-name: {storage_account}
-  account-key: {storage_key}
-  endpoint: https://{storage_account}.blob.core.windows.net
-  mode: key
-  container: {container}
-')
-
-writeLines(config_yaml, '/tmp/blobfuse-config.yaml')
-cat("  ✓ BlobFuse config created\\n")
-
-# Mount using BlobFuse2
-system('mkdir -p /workspace/MOSAIC /tmp/blobfuse-cache')
-mount_result <- system('blobfuse2 mount /workspace/MOSAIC --config-file=/tmp/blobfuse-config.yaml 2>&1')
-
-# Verify mount succeeded
-if (!dir.exists('/workspace/MOSAIC/MOSAIC/MOSAIC-data') || !dir.exists('/workspace/MOSAIC/MOSAIC/MOSAIC-pkg')) {{
-    cat("❌ ERROR: Failed to mount blob storage\\n")
-    cat("Mount exit code:", mount_result, "\\n")
+# Data is included in Docker image - verify it exists
+cat("Verifying MOSAIC data directories...\\n")
+if (!dir.exists('/workspace/MOSAIC/MOSAIC-data')) {{
+    cat("❌ ERROR: MOSAIC-data not found in Docker image\\n")
     system('ls -la /workspace/MOSAIC/')
     quit(status = 1)
 }}
-cat("✅ Blob storage mounted successfully\\n")
+if (!dir.exists('/workspace/MOSAIC/MOSAIC-pkg')) {{
+    cat("❌ ERROR: MOSAIC-pkg not found in Docker image\\n")
+    system('ls -la /workspace/MOSAIC/')
+    quit(status = 1)
+}}
+cat("✅ MOSAIC data directories verified\\n")
 
-# Set MOSAIC root directory to mount point
-set_root_directory('/workspace/MOSAIC/MOSAIC')
+# Set MOSAIC root directory (data is already there!)
+set_root_directory('/workspace/MOSAIC')
 
 # Configure MOSAIC for this country
 iso_codes <- c("{iso_code}")
@@ -222,15 +187,6 @@ def main():
     args = parser.parse_args()
     iso_codes = [x.strip().upper() for x in args.iso.split(',')]
 
-    # Get Azure credentials from environment
-    import os
-    storage_key = os.environ.get('AZURE_STORAGE_KEY')
-    if not storage_key:
-        print("❌ ERROR: AZURE_STORAGE_KEY environment variable not set")
-        print("   Run: source azure/storage_mount/.env")
-        print("   Or:  export AZURE_STORAGE_KEY=<your-key>")
-        sys.exit(1)
-
     print("="*70)
     print("MOSAIC on Coiled - Parallel Country Execution")
     print("="*70)
@@ -239,7 +195,7 @@ def main():
     print(f"Iterations per country: {args.n_iterations}")
     print(f"VM type: {args.vm_type}")
     print(f"Output: {args.output_dir}")
-    print(f"Data source: Azure Blob (ttingeasyva/mosaic-data via BlobFuse2)")
+    print(f"Data source: Included in Docker image")
     print("="*70)
     print()
 
@@ -260,12 +216,7 @@ def main():
         region=args.region,
         software=args.coiled_env,
         shutdown_on_close=True,
-        idle_timeout="3 hours",
-        environ={
-            'AZURE_STORAGE_ACCOUNT': os.environ.get('AZURE_STORAGE_ACCOUNT', 'ttingeasyva'),
-            'AZURE_STORAGE_KEY': storage_key,
-            'AZURE_BLOB_CONTAINER': os.environ.get('AZURE_BLOB_CONTAINER', 'mosaic-data')
-        }
+        idle_timeout="3 hours"
     )
 
     client = Client(cluster)
@@ -301,8 +252,11 @@ def main():
     for result in results:
         status_icon = "✅" if result['status'] == 'success' else "❌"
         print(f"{status_icon} {result['country']}: {result['status']}")
-        if result['status'] == 'failed' and 'error' in result:
-            print(f"   Error: {result['error'][:10000]}")
+        if result['status'] == 'failed':
+            if 'output' in result and result['output']:
+                print(f"   Stdout (last 3000 chars): {result['output'][-3000:]}")
+            if 'error' in result and result['error']:
+                print(f"   Stderr (last 3000 chars): {result['error'][-3000:]}")
 
     print("="*70)
 

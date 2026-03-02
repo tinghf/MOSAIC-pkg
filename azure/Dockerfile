@@ -145,15 +145,19 @@ RUN R -e "library(MOSAIC); \
     if (!result) quit(status = 1)"
 
 # ============================================================
-# Install BlobFuse2 for Azure Blob Storage mounting
+# Clone MOSAIC-data repository
 # ============================================================
-# BlobFuse2 allows mounting Azure Blob Storage in unprivileged containers
-RUN wget https://packages.microsoft.com/config/ubuntu/24.04/packages-microsoft-prod.deb && \
-    dpkg -i packages-microsoft-prod.deb && \
-    apt-get update && \
-    apt-get install -y blobfuse2 fuse3 && \
-    rm -rf /var/lib/apt/lists/* packages-microsoft-prod.deb && \
-    echo "✓ BlobFuse2 installed"
+# Include data in image for direct access (no mounting needed)
+RUN git clone --depth 1 \
+    https://github.com/InstituteforDiseaseModeling/MOSAIC-data \
+    /workspace/MOSAIC/MOSAIC-data && \
+    echo "✓ MOSAIC-data cloned ($(du -sh /workspace/MOSAIC/MOSAIC-data | cut -f1))"
+
+# Create MOSAIC-pkg directory structure
+# (Workers only need model input/output directories)
+RUN mkdir -p /workspace/MOSAIC/MOSAIC-pkg/model/input && \
+    mkdir -p /workspace/MOSAIC/MOSAIC-pkg/model/output && \
+    echo "✓ MOSAIC-pkg directory structure created"
 
 # ============================================================
 # Setup for Coiled workers
@@ -163,12 +167,10 @@ ENV PATH=/root/.virtualenvs/r-mosaic/bin:$PATH
 
 WORKDIR /workspace
 
-# Create directories for MOSAIC workflows and BlobFuse cache
-RUN mkdir -p /workspace/MOSAIC \
-             /workspace/model/input \
+# Create additional directories for MOSAIC workflows
+RUN mkdir -p /workspace/model/input \
              /workspace/model/output \
-             /workspace/data \
-             /tmp/blobfuse-cache
+             /workspace/data
 
 # Default command for Coiled workers
 CMD ["/bin/bash"]

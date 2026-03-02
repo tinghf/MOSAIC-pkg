@@ -50,7 +50,7 @@ echo ""
 
 python azure/run_mosaic_parallel_country.py \
   --iso ETH \
-  --n-simulations 10 \
+  --n-simulations 100 \
   --n-iterations 1 \
   --output-dir ./coiled-mount-test \
   --coiled-env mosaic-docker-workers \
