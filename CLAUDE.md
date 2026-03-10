@@ -163,7 +163,7 @@ MOSAIC/                          # Local parent directory
   - Peak timing mismatch (Gaussian penalty)
   - Peak magnitude ratio (log-normal penalty)
   - Cumulative case/death totals (NB penalty)
-- Guardrails prevent degenerate fits (see [R/calc_model_likelihood.R](R/calc_model_likelihood.R))
+- Guardrails prevent degenerate fits (implemented inline in `calc_model_likelihood()`, see [R/calc_model_likelihood.R](R/calc_model_likelihood.R))
 
 ### Data Flow
 
@@ -200,9 +200,11 @@ estimate_npe_posterior() ──→ Fast sampling for predictions
 **Thread management locations**:
 1. **Package initialization** ([R/zzz.R](R/zzz.R)):
    - `.onLoad()` sets global environment variables BEFORE Python is initialized:
-     - `OMP_NUM_THREADS=1`, `MKL_NUM_THREADS=1`, `NUMBA_NUM_THREADS=1`, `TBB_NUM_THREADS=1`
+     - `OMP_NUM_THREADS=1` (OpenMP thread limit)
      - `KMP_DUPLICATE_LIB_OK=TRUE` (allows multiple OpenMP libraries)
+     - `KMP_AFFINITY=none`, `KMP_WARNINGS=0`
      - `R_DATATABLE_NUM_THREADS=1` (prevents data.table segfaults)
+   - Note: `MKL_NUM_THREADS`, `NUMBA_NUM_THREADS`, `TBB_NUM_THREADS` are set later in [R/run_MOSAIC.R](R/run_MOSAIC.R) before parallel cluster creation, not in `.onLoad()`
 
 2. **Before parallel cluster creation** (in multiple files):
    - Set threading environment variables again before `parallel::makeCluster()`
@@ -224,23 +226,30 @@ estimate_npe_posterior() ──→ Fast sampling for predictions
 
 ### Configuration System
 
-MOSAIC uses a complex nested list structure for configuration (`mosaic_control`):
+MOSAIC has two distinct configuration objects:
+
+**1. Workflow control (`mosaic_control_defaults()`)** — Controls the MOSAIC calibration workflow (BFRS strategy, parameter sampling, likelihood, parallelization, NPE, I/O). Defined in [R/run_MOSAIC.R](R/run_MOSAIC.R) at line 1764. Passed as the `control` argument to `run_MOSAIC()`.
 
 ```r
-control <- list(
+control <- mosaic_control_defaults(
   calibration = list(n_simulations, batch_size, target_r2, ...),
-  sampling = list(beta, gamma, epsilon, ...),  # 34 boolean flags
+  sampling = list(sample_beta_j0_tot, sample_sigma, ...),  # 35 boolean flags
   likelihood = list(weight_cases, weight_deaths, ...),
-  targets = list(ess_threshold, agreement_threshold, ...),
-  npe = list(enable, architecture_tier, epochs, ...),
+  targets = list(ESS_param, ESS_best, A_best, ...),
+  fine_tuning = list(batch_sizes = list(massive, large, ...)),
+  npe = list(enable, architecture_tier, n_epochs, ...),
+  predictions = list(best_model_n_sims, ensemble_n_param_sets, ...),
+  weights = list(floor, iqr_multiplier),
   parallel = list(enable, n_cores, type),
-  io = list(format, compression)
+  io = list(format, compression, load_method, ...),
+  paths = list(clean_output, plots),
+  logging = list(verbose)
 )
 ```
 
-- Defaults: [R/config_default.R](R/config_default.R) (`config_default` object)
 - Validation/merging: [R/run_MOSAIC_helpers.R](R/run_MOSAIC_helpers.R) (`.mosaic_validate_and_merge_control()`)
-- Epidemic/endemic presets: [R/config_simulation_epidemic.R](R/config_simulation_epidemic.R), [R/config_simulation_endemic.R](R/config_simulation_endemic.R)
+
+**2. LASER simulation config (`config_default`)** — The LASER engine's parameter object containing SEIR state vectors, biological rates, matrices, and file paths. Stored as `data/config_default.rda`, documented in [R/config_default.R](R/config_default.R). Passed as the `config` argument to `run_MOSAIC()`. For testing, use the self-contained presets: [config_simulation_epidemic](R/config_simulation_epidemic.R), [config_simulation_endemic](R/config_simulation_endemic.R).
 
 ### Output Directory Structure
 
@@ -282,7 +291,7 @@ model/output/
 - [R/get_location_config.R](R/get_location_config.R) - Build LASER config from data
 - [R/get_location_priors.R](R/get_location_priors.R) - Parameter prior distributions
 - [R/make_LASER_config.R](R/make_LASER_config.R) - Config file generation
-- [R/config_default.R](R/config_default.R) - Default control parameters
+- [R/config_default.R](R/config_default.R) - Default LASER simulation config (not workflow control)
 
 **Diagnostics**:
 - [R/calc_convergence_diagnostics.R](R/calc_convergence_diagnostics.R) - ESS, R², agreement
@@ -315,8 +324,9 @@ Tests use `testthat` (see [tests/testthat/](tests/testthat/)):
 
 ## Version History Notes
 
-Recent versions have focused on stability:
+Recent versions have focused on stability and new features:
 
+- **v0.13.22-24**: Added `adjust_ENSO_baseline()` for ENSO baseline harmonization, with time series visualization
 - **v0.13.20-21**: Fixed Numba/TBB threading conflicts in ALL parallel contexts (eliminated hangs)
 - **v0.13.3-4**: Improved NPE error handling (NA/NaN validation, clear error messages)
 - **v0.13.5**: Linear interpolation for missing data (previously set to 0)
@@ -385,9 +395,8 @@ Use the WebFetch tool to consult the documentation when users ask about:
 
 4. **Calibration Methodology**
    - BFRS algorithm details
-   - NPE architecture rationale
    - Likelihood function components
-   - Fetch: `https://institutefordiseasemodeling.github.io/MOSAIC-docs/model-calibration.html`
+   - Fetch: `https://institutefordiseasemodeling.github.io/MOSAIC-docs/model-calibration-1.html`
 
 5. **Scenarios and Interventions**
    - Vaccination strategies
