@@ -874,9 +874,12 @@ run_MOSAIC_dask <- function(config,
     "streaming"
   }
 
+  load_chunk_size <- control$io$load_chunk_size %||% 5000L
+
   results <- .mosaic_load_and_combine_results(
     dir_params = dirs$bfrs_params,
     method     = load_method,
+    chunk_size = load_chunk_size,
     verbose    = TRUE
   )
 

@@ -967,10 +967,13 @@ run_MOSAIC <- function(config,
     "streaming"  # Safe default
   }
 
+  load_chunk_size <- control$io$load_chunk_size %||% 5000L
+
   results <- .mosaic_load_and_combine_results(
     dir_params = dirs$bfrs_params,
-    method = load_method,
-    verbose = TRUE
+    method     = load_method,
+    chunk_size = load_chunk_size,
+    verbose    = TRUE
   )
 
   # Add index columns
@@ -1954,6 +1957,7 @@ mosaic_control_defaults <- function(calibration = NULL,
     compression = "zstd",
     compression_level = 3L,
     load_method = "streaming",         # "streaming" (memory-safe) or "rbind" (legacy)
+    load_chunk_size = 5000L,           # Files per chunk when loading parquets (streaming method)
     verbose_weights = FALSE            # Print detailed weight calculation diagnostics
   )
 

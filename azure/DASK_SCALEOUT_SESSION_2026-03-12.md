@@ -51,7 +51,17 @@ Issues investigated and resolved while scaling MOSAIC BFRS calibration to 20K-40
 
 **Fix:** Changed to `params_list[idx] <- list(NULL)` (sets to NULL in-place, preserving list length).
 
-## 7. Diagnostic Logging Added
+## 7. Arrow `open_dataset()` OOM on 40K Parquet Files
+
+**Problem:** `arrow::open_dataset() %>% collect()` OOM-killed the R process when loading 40K single-row parquet files (795 MB on disk, but ~10 GB in memory due to per-file metadata overhead). The "streaming" label is misleading — `collect()` materializes everything at once. Parquet is designed for few large files, not thousands of tiny ones.
+
+**Solution:** Replaced `open_dataset() %>% collect()` with chunked loading: read files in batches of N using `arrow::read_parquet()` + `data.table::rbindlist()`, then combine chunks. Chunk size is configurable via `control$io$load_chunk_size` (default 5000). This bounds peak memory to one chunk at a time.
+
+**Affected files:** `R/run_MOSAIC_helpers.R` (`.mosaic_load_and_combine_results()`), `R/run_MOSAIC.R` and `R/run_MOSAIC_dask.R` (callers), `mosaic_control_defaults()` (new `load_chunk_size` io setting).
+
+**Note:** The root cause is writing one parquet per simulation — 40K single-row files is pathological for any reader. A longer-term fix would be batching rows into fewer, larger parquet files.
+
+## 8. Diagnostic Logging Added (throughout session)
 
 Added timing/progress logs at key points in `run_MOSAIC_dask.R`:
 - Gather elapsed time
@@ -60,11 +70,22 @@ Added timing/progress logs at key points in `run_MOSAIC_dask.R`:
 - Memory usage before post-processing
 - Dask client health check
 
-## 8. Orchestrator VM Sizing
+## 9. WSL2 Memory Limit
+
+**Problem:** WSL2 defaults to 50% of host RAM (~16 GB on a 32 GB laptop). Insufficient for 40K+ sim runs even with chunked loading.
+
+**Solution:** Increase WSL2 memory in `C:\Users\<username>\.wslconfig`:
+```
+[wsl2]
+memory=20GB
+```
+Then `wsl --shutdown` and restart.
+
+## 10. Orchestrator VM Sizing
 
 **Analysis:** Local WSL2 is I/O bound (100% disk) + memory constrained (93%). Recommended `Standard_E4s_v6` (4 vCPU, 32 GB, memory-optimized) for running the orchestrator Docker container on Azure.
 
-## 9. Housekeeping
+## 11. Housekeeping
 
 - Created `azure/ACR_SETUP.md` documenting the full ACR setup
 - Moved test script from `/tmp/mosaic_dask_test.R` to `azure/mosaic_dask_test.R`
@@ -77,8 +98,12 @@ Added timing/progress logs at key points in `run_MOSAIC_dask.R`:
 
 | File | Changes |
 |------|---------|
-| `R/run_MOSAIC_dask.R` | ACR default, `scheduler_vm_types`, `docker_login`/`environ`, incremental memory freeing, diagnostic logging, early Dask close |
+| `R/run_MOSAIC_dask.R` | ACR default, `scheduler_vm_types`, `docker_login`/`environ`, incremental memory freeing, diagnostic logging, early Dask close, chunked parquet loading |
+| `R/run_MOSAIC_helpers.R` | Chunked parquet loading in `.mosaic_load_and_combine_results()`, configurable `chunk_size` parameter |
+| `R/run_MOSAIC.R` | Pass `load_chunk_size` to parquet loader, new `load_chunk_size` in `mosaic_control_defaults()` io settings |
 | `azure/ACR_SETUP.md` | New — full ACR setup documentation |
 | `azure/mosaic_dask_test.R` | New — test script (moved from `/tmp`) |
+| `azure/mosaic_dask_fixed_test.R` | New — fixed-mode test (large batch) |
+| `azure/mosaic_dask_adaptive_test.R` | New — adaptive-mode test (multi-batch) |
 | `azure/MOSAIC_DASK_GUIDE.md` | Updated image refs, docker run command, Coiled env name |
 | `azure/DOCKER_COILED_SUMMARY.md` | Updated image refs, Coiled env name |

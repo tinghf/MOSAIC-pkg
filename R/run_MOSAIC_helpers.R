@@ -294,13 +294,16 @@
 #' Two methods available: streaming (default, memory-safe) or rbind (legacy).
 #'
 #' @param dir_params Directory containing sim_*.parquet files
-#' @param method Character. "streaming" (default) uses arrow::open_dataset,
+#' @param method Character. "streaming" (default) uses chunked loading,
 #'   "rbind" loads all files into memory. Streaming is recommended for large runs.
+#' @param chunk_size Integer. Number of files per chunk when method="streaming".
+#'   Default 5000. Smaller values reduce peak memory; larger values are faster.
 #' @param verbose Logical. Print progress messages
 #' @return Data frame with combined simulation results
 #' @noRd
 .mosaic_load_and_combine_results <- function(dir_params,
                                              method = c("streaming", "rbind"),
+                                             chunk_size = 5000L,
                                              verbose = TRUE) {
 
   method <- match.arg(method)
@@ -323,15 +326,36 @@
   # Choose loading strategy
   results <- switch(method,
     streaming = {
-      # Arrow streaming: memory-safe, works for any dataset size
-      arrow::open_dataset(dir_params, format = "parquet") %>%
-        dplyr::collect() %>%
-        as.data.frame()
+      # Chunked loading: read files in batches to control peak memory.
+      # Arrow open_dataset() + collect() on 40K tiny files can OOM because
+      # it materializes everything at once with high per-file overhead.
+      n_chunks   <- ceiling(length(files) / chunk_size)
+
+      if (verbose && n_chunks > 1L) {
+        log_msg("Reading in %d chunks of %d files", n_chunks, chunk_size)
+      }
+
+      chunk_list <- vector("list", n_chunks)
+      for (ci in seq_len(n_chunks)) {
+        idx_start <- (ci - 1L) * chunk_size + 1L
+        idx_end   <- min(ci * chunk_size, length(files))
+        chunk_files <- files[idx_start:idx_end]
+
+        chunk_list[[ci]] <- data.table::rbindlist(
+          lapply(chunk_files, arrow::read_parquet),
+          fill = TRUE
+        )
+
+        if (verbose && n_chunks > 1L) {
+          log_msg("  Chunk %d/%d: read %d files", ci, n_chunks, length(chunk_files))
+        }
+      }
+
+      as.data.frame(data.table::rbindlist(chunk_list, fill = TRUE))
     },
 
     rbind = {
       # Legacy approach: load all into memory then combine
-      # Faster for small datasets, but can OOM for large runs
       if (verbose && length(files) > 10000) {
         warning("Using rbind method with ", length(files),
                 " files may cause memory issues. Consider method='streaming'",
@@ -579,8 +603,9 @@
   ess_check_results <- tryCatch({
     .mosaic_load_and_combine_results(
       dir_params = dirs$bfrs_params,
-      method = "streaming",
-      verbose = FALSE
+      method     = "streaming",
+      chunk_size = control$io$load_chunk_size %||% 5000L,
+      verbose    = FALSE
     )
   }, error = function(e) NULL)
 
