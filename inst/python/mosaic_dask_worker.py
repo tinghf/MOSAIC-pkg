@@ -90,10 +90,15 @@ def _apply_sampled_params(base_config: dict, sampled_params_json: str) -> dict:
     Merge JSON-serialized sampled scalar/vector params into a deep copy of
     base_config.
 
-    base_config already contains numpy arrays for matrix fields (b_jt, psi_jt,
+    base_config already contains numpy arrays for most matrix fields (b_jt,
     etc.) because it was created via reticulate::r_to_py() and then scattered
-    via client.scatter(). Only the sampled scalar/vector params (which arrive
-    as JSON) need explicit numpy conversion.
+    via client.scatter().
+
+    psi_jt is a special case: apply_psi_star_calibration() in R recalculates
+    it per-sim using the sampled psi_star_* params, so the updated psi_jt is
+    sent via JSON per-sim and must override the stale broadcast copy.  It
+    arrives as a list-of-lists (rows × cols) and is converted to a 2-D numpy
+    array here.
 
     A deep copy of base_config is made to prevent mutation of the scattered
     object across simulations on the same worker.
@@ -106,6 +111,12 @@ def _apply_sampled_params(base_config: dict, sampled_params_json: str) -> dict:
     for field, val in sampled.items():
         if field in _VECTOR_FIELDS and isinstance(val, (list, tuple)):
             sampled[field] = np.array(val, dtype=float)
+
+    # Convert list-of-lists → numpy 2-D array for matrix fields sent per-sim
+    # (currently only psi_jt; other matrices are unchanged across sims)
+    for field in _MATRIX_FIELDS:
+        if field in sampled and isinstance(sampled[field], (list, tuple)):
+            sampled[field] = np.array(sampled[field], dtype=float)
 
     config.update(sampled)
     return config
@@ -221,6 +232,10 @@ def run_laser_sim(sim_id: int, n_iterations: int,
             "success": True,
             "worker_elapsed_sec": worker_elapsed_sec,
             "iterations": iterations,
+            # Return post-JSON-roundtrip psi_jt for validation — lets R compare
+            # the binary-exact (local) vs JSON-deserialized (Dask) values to
+            # confirm precision loss is at the ULP level (~1e-16).
+            "psi_jt": config["psi_jt"].tolist(),
         }
 
     except Exception as exc:  # noqa: BLE001

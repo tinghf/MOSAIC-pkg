@@ -430,6 +430,7 @@
     bfrs_diag = file.path(dir_output, "1_bfrs/diagnostics"),
     bfrs_out = file.path(dir_output, "1_bfrs/outputs"),
     bfrs_params = file.path(dir_output, "1_bfrs/outputs/parameters"),
+    bfrs_simresults = file.path(dir_output, "1_bfrs/outputs/simulation_results"),
     bfrs_post = file.path(dir_output, "1_bfrs/posterior"),
     bfrs_plots = file.path(dir_output, "1_bfrs/plots"),
     bfrs_plots_diag = file.path(dir_output, "1_bfrs/plots/diagnostics"),

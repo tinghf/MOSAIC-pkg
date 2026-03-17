@@ -28,6 +28,7 @@
 #' @noRd
 .mosaic_run_simulation_worker <- function(sim_id, n_iterations, priors, config, PATHS,
                                           dir_bfrs_parameters, dir_bfrs_timeseries,
+                                          dir_bfrs_simresults = NULL,
                                           param_names_all, sampling_args, io,
                                           save_timeseries = TRUE) {
 
@@ -211,6 +212,30 @@
     output_matrix <- output_matrix[1:(output_row_idx - 1), , drop = FALSE]
   } else {
     output_matrix <- output_matrix[0, , drop = FALSE]  # Empty matrix
+  }
+
+  # Write raw (uncollapsed) simulation results for validation
+  if (!is.null(dir_bfrs_simresults) && nrow(output_matrix) > 0) {
+    raw_df <- data.frame(
+      sim    = as.integer(output_matrix[, 1]),
+      iter   = as.integer(output_matrix[, 2]),
+      j      = as.integer(output_matrix[, 3]),
+      t      = as.integer(output_matrix[, 4]),
+      cases  = as.numeric(output_matrix[, 5]),
+      deaths = as.numeric(output_matrix[, 6])
+    )
+    # Append simulation parameters (constant within a sim, replicated per row)
+    param_vals <- as.numeric(result_matrix[1, param_names_all])
+    for (pi in seq_along(param_names_all)) {
+      raw_df[[param_names_all[pi]]] <- param_vals[pi]
+    }
+    # Add psi_jt[j, t] for validation — the exact binary value LASER received
+    if (!is.null(params_sim$psi_jt)) {
+      raw_df$psi_jt <- params_sim$psi_jt[cbind(raw_df$j, raw_df$t)]
+    }
+    simresults_file <- file.path(dir_bfrs_simresults,
+                                 sprintf("simresults_%07d.parquet", sim_id))
+    .mosaic_write_parquet(raw_df, simresults_file, io)
   }
 
   # Collapse iterations if n_iterations > 1
@@ -709,6 +734,7 @@ run_MOSAIC <- function(config,
           PATHS = PATHS,
           dir_bfrs_parameters = dirs$bfrs_params,
           dir_bfrs_timeseries = if (control$npe$enable) dirs$bfrs_times else NULL,
+          dir_bfrs_simresults = dirs$bfrs_simresults,
           param_names_all = param_names_all,
           sampling_args = sampling_args,
           io = control$io,
@@ -797,6 +823,7 @@ run_MOSAIC <- function(config,
             sim_id, n_iterations, priors, config, PATHS,
             dirs$bfrs_params,
             if (control$npe$enable) dirs$bfrs_times else NULL,
+            dir_bfrs_simresults = dirs$bfrs_simresults,
             param_names_all, sampling_args,
             io = control$io,
             save_timeseries = control$npe$enable
@@ -906,6 +933,7 @@ run_MOSAIC <- function(config,
             sim_id, n_iterations, priors, config, PATHS,
             dirs$bfrs_params,
             if (control$npe$enable) dirs$bfrs_times else NULL,
+            dir_bfrs_simresults = dirs$bfrs_simresults,
             param_names_all, sampling_args,
             io = control$io,
             save_timeseries = control$npe$enable

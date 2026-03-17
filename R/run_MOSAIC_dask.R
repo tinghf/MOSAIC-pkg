@@ -43,12 +43,18 @@
 #' Extract Per-Simulation Sampled Parameters
 #'
 #' Returns only the scalar/vector parameters that sample_parameters() modifies.
-#' Matrix fields are excluded because they live in the broadcast base_config.
+#' Most matrix fields are excluded because they live in the broadcast
+#' base_config. However, psi_jt is INCLUDED here because
+#' apply_psi_star_calibration() modifies it in-place per simulation — the
+#' broadcast base_config has stale (uncalibrated) psi_jt.
 #' @noRd
 .extract_sampled_params <- function(params_sim) {
-  # Exclude fields that are in the broadcast base_config
+  # Exclude fields that are in the broadcast base_config AND are never
+  # modified by sample_parameters().  psi_jt is intentionally NOT excluded:
+  # apply_psi_star_calibration() recalculates it per-sim using psi_star_*
+  # params, so the per-sim version must override the broadcast base_config.
   base_fields <- c(
-    "b_jt", "d_jt", "mu_jt", "psi_jt", "nu_1_jt", "nu_2_jt",
+    "b_jt", "d_jt", "mu_jt", "nu_1_jt", "nu_2_jt",
     "reported_cases", "reported_deaths",
     "date_start", "date_stop", "location_name", "seed",
     "N_j_initial", "longitude", "latitude"
@@ -251,15 +257,7 @@
       )
     }
 
-    # Collapse iterations exactly as .mosaic_run_simulation_worker does
-    if (n_iter_got > 1L) {
-      valid_lls <- lls[is.finite(lls)]
-      collapsed_ll <- if (length(valid_lls)) calc_log_mean_exp(valid_lls) else NA_real_
-    } else {
-      collapsed_ll <- lls[1L]
-    }
-
-    # Extract flat param vector for parquet row
+    # Extract flat param vector (used by both simresults and parameter parquet)
     raw_params <- tryCatch({
       pv <- convert_config_to_matrix(params_list[[idx]])
       if ("seed" %in% names(pv)) pv <- pv[names(pv) != "seed"]
@@ -269,6 +267,55 @@
     if (is.null(raw_params)) {
       success_indicators[idx] <- FALSE
       next
+    }
+
+    # Write raw (uncollapsed) simulation results for validation
+    if (!is.null(dirs$bfrs_simresults)) {
+      # Extract the post-JSON-roundtrip psi_jt returned by the Dask worker.
+      # This is the value LASER actually used (after JSON→numpy conversion).
+      worker_psi_jt <- if (!is.null(res$psi_jt)) {
+        matrix(unlist(res$psi_jt), nrow = n_locs, byrow = FALSE)
+      } else {
+        params_list[[idx]]$psi_jt  # fallback to R-side value
+      }
+      simresults_rows <- vector("list", n_iter_got)
+      for (ji2 in seq_len(n_iter_got)) {
+        iter_res2  <- iter_list[[ji2]]
+        ec2 <- matrix(unlist(iter_res2$expected_cases),
+                       nrow = n_locs, byrow = FALSE)
+        dd2 <- matrix(unlist(iter_res2$disease_deaths),
+                       nrow = n_locs, byrow = FALSE)
+        n_t2 <- ncol(ec2)
+        sr_df <- data.frame(
+          sim    = rep(as.integer(sim_id), n_locs * n_t2),
+          iter   = rep(as.integer(ji2), n_locs * n_t2),
+          j      = rep(seq_len(n_locs), times = n_t2),
+          t      = rep(seq_len(n_t2), each = n_locs),
+          cases  = as.numeric(ec2),
+          deaths = as.numeric(dd2)
+        )
+        # Append simulation parameters (constant within a sim, replicated per row)
+        for (pi in seq_along(param_names_all)) {
+          sr_df[[param_names_all[pi]]] <- as.numeric(raw_params[param_names_all[pi]])
+        }
+        # Add psi_jt[j, t] — the post-JSON-roundtrip value the worker used
+        if (!is.null(worker_psi_jt)) {
+          sr_df$psi_jt <- worker_psi_jt[cbind(sr_df$j, sr_df$t)]
+        }
+        simresults_rows[[ji2]] <- sr_df
+      }
+      simresults_df <- do.call(rbind, simresults_rows)
+      simresults_file <- file.path(dirs$bfrs_simresults,
+                                   sprintf("simresults_%07d.parquet", sim_id))
+      .mosaic_write_parquet(simresults_df, simresults_file, control$io)
+    }
+
+    # Collapse iterations exactly as .mosaic_run_simulation_worker does
+    if (n_iter_got > 1L) {
+      valid_lls <- lls[is.finite(lls)]
+      collapsed_ll <- if (length(valid_lls)) calc_log_mean_exp(valid_lls) else NA_real_
+    } else {
+      collapsed_ll <- lls[1L]
     }
 
     # Seed used for the first iteration (mirrors run_MOSAIC.R line 224)
