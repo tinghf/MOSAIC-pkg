@@ -127,6 +127,96 @@ The `psi_jt` bug from Take 1 is fixed. All 48 scalar/vector parameters match exa
 
 ### The JSON serialization precision problem
 
+```mermaid
+
+flowchart TB
+    subgraph shared["Shared Setup (R)"]
+        A[config ← get_location_config] --> B[priors ← get_location_priors]
+        B --> C["ctrl ← mosaic_control_defaults()"]
+    end
+
+    shared --> LOCAL
+    shared --> DASK
+
+    subgraph LOCAL["LOCAL PATH — run_MOSAIC()"]
+        direction TB
+        L1["PSOCK cluster<br/>makeCluster(8)"]
+        L2["sample_parameters()<br/>→ params_sim (R list)<br/>incl. calibrated psi_jt"]
+        L3["reticulate::r_to_py()<br/>🟢 binary conversion<br/>float64 → float64<br/>BIT-EXACT"]
+        L4["lc$run_model(paramfile=params)<br/>LASER simulation"]
+        L5["expected_cases, disease_deaths"]
+        L6["calc_model_likelihood()"]
+        L7["Write simresults parquet<br/>psi_jt = params_sim$psi_jt\[j,t\]<br/>(ground truth)"]
+
+        L1 --> L2 --> L3 --> L4 --> L5 --> L6
+        L5 --> L7
+    end
+
+    subgraph DASK["DASK PATH — run_MOSAIC_dask()"]
+        direction TB
+
+        subgraph R_SIDE["R Orchestrator"]
+            D1["sample_parameters()<br/>→ params_list\[\[idx\]\] (R list)<br/>incl. calibrated psi_jt"]
+            D2[".extract_sampled_params()<br/>excludes base_fields (b_jt, d_jt, ...)<br/>INCLUDES psi_jt + all vectors/scalars"]
+            D3["jsonlite::toJSON(digits=NA)<br/>🔴 sprintf('%.15g', x)<br/>15 sig digits → LOSES ~1-2 ULPs<br/>PRECISION LOSS HERE"]
+            D4["client$scatter(base_config)<br/>🟢 binary/pickle (once)"]
+            D5["client$submit(<br/>  run_laser_sim,<br/>  sim_id, n_iter,<br/>  json_string,<br/>  base_config_future<br/>)"]
+
+            D1 --> D2 --> D3 --> D5
+            D4 --> D5
+        end
+
+        D5 -.->|"network<br/>(Dask scheduler<br/>→ Coiled VM)"| WORKER
+
+        subgraph WORKER["Python Dask Worker (mosaic_dask_worker.py)"]
+            W1["_apply_sampled_params()"]
+            W2["config = deepcopy(base_config)<br/>🟢 binary-exact copy"]
+            W3["sampled = json.loads(json_string)<br/>🔴 '0.1' → 0.09999999999999999<br/>nearest float64 to truncated decimal"]
+            W4["np.array(val, dtype=float)<br/>list-of-lists → numpy 2D<br/>(no further loss)"]
+            W5["config.update(sampled)<br/>overrides stale psi_jt"]
+            W6["lc.run_model(paramfile=config)<br/>LASER simulation<br/>same seed, ~1 ULP different thresholds<br/>→ occasional random draw flips"]
+            W7["Return dict:<br/>iterations: \[cases, deaths\]<br/>psi_jt: config\['psi_jt'\].tolist()"]
+
+            W1 --> W2 --> W3 --> W4 --> W5 --> W6 --> W7
+        end
+
+        W7 -.->|"network<br/>(Dask gather<br/>pickle/binary)"| R_GATHER
+
+        subgraph R_GATHER["R Post-Processing"]
+            G1["client$gather(futures)<br/>reticulate: Python → R (binary)"]
+            G2["calc_model_likelihood()"]
+            G3["Write simresults parquet<br/>psi_jt = worker-returned value<br/>(post-JSON-roundtrip)"]
+        end
+
+        G1 --> G2
+        G1 --> G3
+    end
+
+    subgraph COMPARE["Comparison (compare_validation_results.R)"]
+        direction LR
+        C1["Local parquet<br/>psi_jt: 0.10000000000000001"]
+        C2["Dask parquet<br/>psi_jt: 0.09999999999999999"]
+        C3["Diff: 2.22e-16<br/>(1 ULP)"]
+        C4["Cases diff: ±0-456<br/>(butterfly effect)"]
+
+        C1 --> C3
+        C2 --> C3
+        C3 --> C4
+    end
+
+    L7 --> COMPARE
+    G3 --> COMPARE
+
+    style D3 fill:#ff6b6b,color:#fff,stroke:#c0392b
+    style W3 fill:#ff6b6b,color:#fff,stroke:#c0392b
+    style L3 fill:#2ecc71,color:#fff,stroke:#27ae60
+    style W2 fill:#2ecc71,color:#fff,stroke:#27ae60
+    style D4 fill:#2ecc71,color:#fff,stroke:#27ae60
+    style C3 fill:#f39c12,color:#fff,stroke:#e67e22
+    style C4 fill:#f39c12,color:#fff,stroke:#e67e22
+
+```
+
 The local and Dask paths deliver parameters to LASER through different serialization mechanisms:
 
 **Local path** (bit-exact):
