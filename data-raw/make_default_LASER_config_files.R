@@ -347,10 +347,10 @@ default_args <- list(
      mu_j_epidemic_factor = mu_j_epidemic_factor,  # NEW: Epidemic increase factor
      sigma = 0.25,
      # Case reporting parameters for calc_cases_from_infections()
-     rho = 0.7,                   # Proportion of symptomatic infections seeking care
+     rho = 0.265,                 # Care-seeking rate (mean of Beta(6.8, 17.9) prior, GEMS + Wiens 2025)
      chi_endemic = 0.50,          # PPV among suspected cases during endemic periods (50%)
      chi_epidemic = 0.75,         # PPV among suspected cases during epidemic periods (75%)
-     epidemic_threshold = 1/10000,  # Infection rate threshold for PPV switching (1 per 10k per day)
+     epidemic_threshold = rep(1/10000, length(j)),  # Per-location Isym/N threshold for PPV switching (1 per 10k)
      delta_reporting_cases = 2,   # NEW: Infection-to-case report delay in days
      delta_reporting_deaths = 7,  # NEW: Infection-to-death report delay in days
      longitude         = longitude,

@@ -141,9 +141,10 @@ calc_model_likelihood <- function(obs_cases,
      if (enable_guardrails) {
 
           # Vectorized per-timestep ratio checks
+          # Skip timesteps where est=0 (model startup delay); the cumulative check handles dead models.
           # Check cases
           ratio_cases <- est_cases / obs_cases
-          valid_cases <- is.finite(ratio_cases) & obs_cases >= min_obs_for_ratio
+          valid_cases <- is.finite(ratio_cases) & obs_cases >= min_obs_for_ratio & est_cases > 0
           bad_cases <- which(valid_cases & (ratio_cases > max_timestep_ratio | ratio_cases < min_timestep_ratio),
                             arr.ind = TRUE)
           if (nrow(bad_cases) > 0) {
@@ -157,7 +158,7 @@ calc_model_likelihood <- function(obs_cases,
 
           # Check deaths
           ratio_deaths <- est_deaths / obs_deaths
-          valid_deaths <- is.finite(ratio_deaths) & obs_deaths >= min_obs_for_ratio
+          valid_deaths <- is.finite(ratio_deaths) & obs_deaths >= min_obs_for_ratio & est_deaths > 0
           bad_deaths <- which(valid_deaths & (ratio_deaths > max_timestep_ratio | ratio_deaths < min_timestep_ratio),
                              arr.ind = TRUE)
           if (nrow(bad_deaths) > 0) {
@@ -538,24 +539,32 @@ ll_cumulative_progressive_nb <- function(obs_vec,
           getOption("MOSAIC.cumulative_k", 10)
      }
      
+     vals <- vector("numeric", length(timepoints))
+     n_vals <- 0L
+
      for (tp in timepoints) {
-          # Fix: Ensure index is at least 1 and at most n
+          # Ensure index is at least 1 and at most n
           end_idx <- min(n, max(1L, round(n * tp)))
-          
-          # Apply weights to cumulative sums
-          idx_range <- 1:end_idx
-          o_cum <- sum(obs_vec[idx_range] * weights_time[idx_range], na.rm = TRUE) / sum(weights_time[idx_range], na.rm = TRUE) * end_idx
-          e_cum <- sum(est_vec[idx_range] * weights_time[idx_range], na.rm = TRUE) / sum(weights_time[idx_range], na.rm = TRUE) * end_idx
-          
+
+          # Use plain cumulative sums (NA-safe).
+          # weights_time is for masking non-observed timesteps in the core NB
+          # likelihood, but the cumulative term needs actual totals — using a
+          # weighted mean times end_idx would inflate the sum proportionally to
+          # the fraction of NA timesteps (e.g. 50% NAs → 2× inflation).
+          idx_range <- seq_len(end_idx)
+          o_cum <- sum(obs_vec[idx_range], na.rm = TRUE)
+          e_cum <- sum(est_vec[idx_range], na.rm = TRUE)
+
           if (!is.finite(o_cum) || !is.finite(e_cum)) next
-          if (e_cum <= 0 && o_cum > 0) { vals <- c(vals, per_tp_ll_floor); next }
+          if (e_cum <= 0 && o_cum > 0) { n_vals <- n_vals + 1L; vals[n_vals] <- per_tp_ll_floor; next }
           e_cum <- if (e_cum <= 0) .Machine$double.eps else e_cum
           ll_tp <- stats::dnbinom(round(o_cum), mu = e_cum, size = cum_k, log = TRUE)
           if (!is.finite(ll_tp)) ll_tp <- per_tp_ll_floor
-          vals <- c(vals, ll_tp)
+          n_vals <- n_vals + 1L
+          vals[n_vals] <- ll_tp
      }
-     if (!length(vals)) return(per_tp_ll_floor)
-     mean(vals)
+     if (n_vals == 0L) return(per_tp_ll_floor)
+     mean(vals[seq_len(n_vals)])
 }
 
 

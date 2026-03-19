@@ -320,11 +320,11 @@ plot_model_fit_stochastic_param <- function(
         stoch_idx <- task_info$stoch_idx
 
         tryCatch({
-            # Get laser_cholera from worker global environment
+            # Get laser.cholera from worker global environment
             # Parallel mode: lc exists in worker global environment (imported during init)
             # Sequential mode: import here
             if (!exists("lc", where = .GlobalEnv, inherits = FALSE)) {
-                lc <- reticulate::import("laser_cholera.metapop.model")
+                lc <- reticulate::import("laser.cholera.metapop.model")
             } else {
                 lc <- get("lc", envir = .GlobalEnv)
             }
@@ -337,13 +337,13 @@ plot_model_fit_stochastic_param <- function(
             param_config$seed <- stochastic_seed
 
             # Run model
-            model <- lc$run_model(paramfile = param_config, quiet = TRUE)
+            model <- lc$run_model(paramfile = MOSAIC:::.mosaic_prepare_config_for_python(param_config), quiet = TRUE)
 
             # Extract results before cleanup
             result <- list(
                 param_idx = param_idx,
                 stoch_idx = stoch_idx,
-                expected_cases = model$results$expected_cases,
+                reported_cases = model$results$reported_cases,
                 disease_deaths = model$results$disease_deaths,
                 success = TRUE
             )
@@ -423,9 +423,9 @@ plot_model_fit_stochastic_param <- function(
                 OPENBLAS_NUM_THREADS = "1"
             )
 
-            # Import laser-cholera ONCE per worker (not per task)
+            # Import laser.cholera ONCE per worker (not per task)
             # This avoids repeated import overhead (~200-500ms per import on cluster)
-            lc <- reticulate::import("laser_cholera.metapop.model")
+            lc <- reticulate::import("laser.cholera.metapop.model")
             assign("lc", lc, envir = .GlobalEnv)
 
             NULL
@@ -443,17 +443,9 @@ plot_model_fit_stochastic_param <- function(
         parallel::clusterExport(cl, c("param_configs"), envir = environment())
 
         # Run parallel simulations
-        if (verbose) {
-            message("Running ", total_simulations, " simulations on ", n_cores_use, " cores...")
-            # Simple progress bar with block character (no color codes)
-            # style = 1: Shows elapsed and remaining time with percentage
-            pbo <- pbapply::pboptions(type = "timer", char = "█", style = 1)
-            on.exit(pbapply::pboptions(pbo), add = TRUE)
-        } else {
-            # Explicitly disable progress bar for non-verbose mode (prevents cluster hangs)
-            pbo <- pbapply::pboptions(type = "none")
-            on.exit(pbapply::pboptions(pbo), add = TRUE)
-        }
+        if (verbose) message("Running ", total_simulations, " simulations on ", n_cores_use, " cores...")
+        pbo <- pbapply::pboptions(type = "timer", char = "█", style = 1)
+        on.exit(pbapply::pboptions(pbo), add = TRUE)
 
         results_list <- pbapply::pblapply(
             split(task_list, seq(nrow(task_list))),
@@ -467,11 +459,11 @@ plot_model_fit_stochastic_param <- function(
                 p <- result$param_idx
                 s <- result$stoch_idx
 
-                if (is.matrix(result$expected_cases)) {
-                    cases_array[,,p,s] <- result$expected_cases
+                if (is.matrix(result$reported_cases)) {
+                    cases_array[,,p,s] <- result$reported_cases
                     deaths_array[,,p,s] <- result$disease_deaths
                 } else {
-                    cases_array[1,,p,s] <- result$expected_cases
+                    cases_array[1,,p,s] <- result$reported_cases
                     deaths_array[1,,p,s] <- result$disease_deaths
                 }
             }
@@ -482,17 +474,9 @@ plot_model_fit_stochastic_param <- function(
         # SEQUENTIAL EXECUTION
         # ========================================================================
 
-        if (verbose) {
-            message("Running ", total_simulations, " simulations sequentially...")
-            # Simple progress bar with block character (no color codes)
-            # style = 1: Shows elapsed and remaining time with percentage
-            pbo <- pbapply::pboptions(type = "timer", char = "█", style = 1)
-            on.exit(pbapply::pboptions(pbo), add = TRUE)
-        } else {
-            # Explicitly disable progress bar for non-verbose mode (prevents cluster hangs)
-            pbo <- pbapply::pboptions(type = "none")
-            on.exit(pbapply::pboptions(pbo), add = TRUE)
-        }
+        if (verbose) message("Running ", total_simulations, " simulations sequentially...")
+        pbo <- pbapply::pboptions(type = "timer", char = "█", style = 1)
+        on.exit(pbapply::pboptions(pbo), add = TRUE)
 
         # Create flattened task list for sequential execution with progress bar
         task_list <- expand.grid(
@@ -511,11 +495,11 @@ plot_model_fit_stochastic_param <- function(
                 p <- result$param_idx
                 s <- result$stoch_idx
 
-                if (is.matrix(result$expected_cases)) {
-                    cases_array[,,p,s] <- result$expected_cases
+                if (is.matrix(result$reported_cases)) {
+                    cases_array[,,p,s] <- result$reported_cases
                     deaths_array[,,p,s] <- result$disease_deaths
                 } else {
-                    cases_array[1,,p,s] <- result$expected_cases
+                    cases_array[1,,p,s] <- result$reported_cases
                     deaths_array[1,,p,s] <- result$disease_deaths
                 }
             }
@@ -654,7 +638,7 @@ plot_model_fit_stochastic_param <- function(
         loc_data <- data.frame(
             location = location_names[i],
             date = rep(dates, 2),
-            metric = c(rep("Cases", n_time_points), rep("Deaths", n_time_points)),
+            metric = c(rep("Suspected Cases", n_time_points), rep("Deaths", n_time_points)),
             observed = c(obs_cases_i, obs_deaths_i),
             predicted_median = c(cases_overall$median[i,], deaths_overall$median[i,])
         )
@@ -675,7 +659,7 @@ plot_model_fit_stochastic_param <- function(
         plot_data <- rbind(plot_data, loc_data)
     }
 
-    plot_data$metric <- factor(plot_data$metric, levels = c("Cases", "Deaths"))
+    plot_data$metric <- factor(plot_data$metric, levels = c("Suspected Cases", "Deaths"))
 
     # ============================================================================
     # Save predictions to CSV (if requested)
@@ -757,9 +741,9 @@ plot_model_fit_stochastic_param <- function(
                              linewidth = 0.75) +
             # Facet by metric
             ggplot2::facet_grid(metric ~ ., scales = "free_y", switch = "y") +
-            ggplot2::scale_color_manual(values = c("Cases" = "steelblue", "Deaths" = "darkred"),
+            ggplot2::scale_color_manual(values = c("Suspected Cases" = "steelblue", "Deaths" = "darkred"),
                                        guide = "none") +
-            ggplot2::scale_fill_manual(values = c("Cases" = "steelblue", "Deaths" = "darkred"),
+            ggplot2::scale_fill_manual(values = c("Suspected Cases" = "steelblue", "Deaths" = "darkred"),
                                       guide = "none") +
             ggplot2::scale_y_continuous(labels = scales::comma) +
             ggplot2::theme_minimal(base_size = 10) +
