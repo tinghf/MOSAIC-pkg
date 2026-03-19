@@ -4,7 +4,7 @@
 #' timeseries plots showing mean predictions with confidence envelopes.
 #'
 #' @param config A configuration list/object as produced by sample_parameters().
-#'   Must contain all necessary parameters for running laser_cholera model including:
+#'   Must contain all necessary parameters for running laser.cholera model including:
 #'   \itemize{
 #'     \item reported_cases - observed cases data
 #'     \item reported_deaths - observed deaths data
@@ -171,19 +171,19 @@ plot_model_fit_stochastic <- function(config,
     # Worker function (must be self-contained for parallel execution)
     run_single_simulation <- function(seed_i, config_template) {
         tryCatch({
-            # Import laser_cholera on worker (each worker needs its own instance)
-            lc <- reticulate::import("laser_cholera.metapop.model")
+            # Import laser.cholera on worker (each worker needs its own instance)
+            lc <- reticulate::import("laser.cholera.metapop.model")
 
             # Modify config with specific seed
             config_i <- config_template
             config_i$seed <- seed_i
 
             # Run model
-            model <- lc$run_model(paramfile = config_i, quiet = TRUE)
+            model <- lc$run_model(paramfile = MOSAIC:::.mosaic_prepare_config_for_python(config_i), quiet = TRUE)
 
             # Extract results before cleanup
             result <- list(
-                expected_cases = model$results$expected_cases,
+                reported_cases = model$results$reported_cases,
                 disease_deaths = model$results$disease_deaths,
                 success = TRUE,
                 seed = seed_i
@@ -266,13 +266,9 @@ plot_model_fit_stochastic <- function(config,
         parallel::clusterExport(cl, c("config", "run_single_simulation"), envir = environment())
 
         # Run parallel simulations
-        if (verbose) {
-            message("Running ", n_simulations, " simulations on ", n_cores_use, " cores...")
-            # Simple progress bar with block character (no color codes)
-            # style = 1: Shows elapsed and remaining time with percentage
-            pbo <- pbapply::pboptions(type = "timer", char = "█", style = 1)
-            on.exit(pbapply::pboptions(pbo), add = TRUE)
-        }
+        if (verbose) message("Running ", n_simulations, " simulations on ", n_cores_use, " cores...")
+        pbo <- pbapply::pboptions(type = "timer", char = "█", style = 1)
+        on.exit(pbapply::pboptions(pbo), add = TRUE)
 
         simulation_results <- pbapply::pblapply(
             seeds,
@@ -345,11 +341,11 @@ plot_model_fit_stochastic <- function(config,
         result <- successful_results[[i]]
 
         # Handle both matrix and vector formats
-        if (is.matrix(result$expected_cases)) {
-            cases_array[,,i] <- result$expected_cases
+        if (is.matrix(result$reported_cases)) {
+            cases_array[,,i] <- result$reported_cases
             deaths_array[,,i] <- result$disease_deaths
         } else {
-            cases_array[1,,i] <- result$expected_cases
+            cases_array[1,,i] <- result$reported_cases
             deaths_array[1,,i] <- result$disease_deaths
         }
     }
@@ -455,7 +451,7 @@ plot_model_fit_stochastic <- function(config,
         loc_data <- data.frame(
             location = location_names[i],
             date = rep(dates, 2),
-            metric = c(rep("Cases", n_time_points), rep("Deaths", n_time_points)),
+            metric = c(rep("Suspected Cases", n_time_points), rep("Deaths", n_time_points)),
             observed = c(obs_cases_i, obs_deaths_i),
             predicted_mean = c(cases_mean_i, deaths_mean_i),
             predicted_lower = c(cases_lower_i, deaths_lower_i),
@@ -466,7 +462,7 @@ plot_model_fit_stochastic <- function(config,
     }
 
     # Convert metric to factor
-    plot_data$metric <- factor(plot_data$metric, levels = c("Cases", "Deaths"))
+    plot_data$metric <- factor(plot_data$metric, levels = c("Suspected Cases", "Deaths"))
 
     # ============================================================================
     # Save predictions to CSV (if requested)
@@ -548,10 +544,10 @@ plot_model_fit_stochastic <- function(config,
             ggplot2::facet_grid(metric ~ .,
                               scales = "free_y",
                               switch = "y") +
-            ggplot2::scale_color_manual(values = c("Cases" = "steelblue",
+            ggplot2::scale_color_manual(values = c("Suspected Cases" = "steelblue",
                                                   "Deaths" = "darkred"),
                                        guide = "none") +
-            ggplot2::scale_fill_manual(values = c("Cases" = "steelblue",
+            ggplot2::scale_fill_manual(values = c("Suspected Cases" = "steelblue",
                                                  "Deaths" = "darkred"),
                                       guide = "none") +
             ggplot2::scale_y_continuous(labels = scales::comma) +
@@ -623,7 +619,7 @@ plot_model_fit_stochastic <- function(config,
 
     if (n_locations > 1) {
         # Filter for cases only
-        cases_data <- plot_data[plot_data$metric == "Cases",]
+        cases_data <- plot_data[plot_data$metric == "Suspected Cases",]
 
         # Calculate overall statistics
         all_obs_cases <- if(is.matrix(obs_cases)) as.vector(obs_cases) else obs_cases
@@ -671,8 +667,8 @@ plot_model_fit_stochastic <- function(config,
             ) +
             ggplot2::labs(
                 x = if(use_date_axis) "Date" else "Time",
-                y = "Cases",
-                title = "Stochastic Model Fit: Cases by Location",
+                y = "Suspected Cases",
+                title = "Stochastic Model Fit: Suspected Cases by Location",
                 subtitle = paste0(
                     "Median prediction with ",
                     round((envelope_quantiles[2] - envelope_quantiles[1]) * 100), "% range | ",

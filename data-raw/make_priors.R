@@ -13,9 +13,23 @@ date_start <- as.Date(config_default$date_start)
 
 j <- MOSAIC::iso_codes_mosaic
 
+#----------------------------------------
+# Load surveillance and demographics data for epidemic_threshold priors
+#----------------------------------------
+
+surv_weekly <- read.csv(
+     file.path(PATHS$DATA_PROCESSED, "cholera/weekly/cholera_surveillance_weekly_combined.csv"),
+     stringsAsFactors = FALSE
+)
+
+dem_annual <- read.csv(
+     file.path(PATHS$DATA_PROCESSED, "demographics/demographics_mosaic_countries_2000_2024_annual.csv"),
+     stringsAsFactors = FALSE
+)
+
 priors_default <- list(
      metadata = list(
-          version = "9.0.0",
+          version = "12.0",
           date = Sys.Date(),
           description = "Default informative prior distributions for MOSAIC model parameters"
      ),
@@ -46,31 +60,49 @@ priors_default$parameters_global$alpha_2 <- list(
 )
 
 # decay_days_long - Maximum V. cholerae survival time
+# Old posterior 97.5th=147.4 was within 2.6 of upper bound=150 -- clear upper truncation.
+# Extended to 365 days. Lower bound is 30; decay_days_short upper bound is 29,
+# ensuring at least 1-day gap to prevent boundary equality violations.
 priors_default$parameters_global$decay_days_long <- list(
      description = "Maximum V. cholerae survival time (days)",
      distribution = "uniform",
-     parameters = list(min = 30, max = 150)
+     parameters = list(min = 30, max = 365)
 )
 
 # decay_days_short - Minimum V. cholerae survival time
+# Upper bound set to 29 (not 30) to guarantee a minimum 1-day gap from
+# decay_days_long's lower bound of 30, preventing boundary equality violations
+# in make_LASER_config(). The swap constraint in sample_parameters.R also
+# protects against accidental crossings.
 priors_default$parameters_global$decay_days_short <- list(
      description = "Minimum V. cholerae survival time (days)",
      distribution = "uniform",
-     parameters = list(min = 0.01, max = 30)
+     parameters = list(min = 0.01, max = 29)
 )
 
 # decay_shape_1 - First shape parameter of Beta distribution for V. cholerae decay rate transformation
+# Bounds [0.1, 10]: lower bound 0.1 allows U-shaped (arcsine-type) mapping where survival responds
+# mainly at environmental extremes. Upper bound 10 supported by empirical evidence: 85% of 84
+# country-level calibrations had posterior q97.5 > 4.8 against old bound=5.
+# Functionally, s1=s2=10 spans 99.7% of [days_short, days_long] across psi in [0.2,0.8] --
+# steep sigmoid but not a step function; increment from s=5 to s=10 is only ~3 days of extra variation.
 priors_default$parameters_global$decay_shape_1 <- list(
      description = "First shape parameter of Beta distribution for V. cholerae decay",
      distribution = "uniform",
-     parameters = list(min = 0.5, max = 5.0)
+     parameters = list(min = 0.1, max = 10.0)
 )
 
 # decay_shape_2 - Second shape parameter of Beta distribution for V. cholerae decay rate transformation
+# Same rationale as decay_shape_1. Upper bound extended to 10: 85% of calibration runs (n=84)
+# across all MOSAIC countries had posterior q97.5 > 4.8 against the old bound=5, confirming
+# truncation. Functionally, s1=s2=10 spans 99.7% of the [days_short, days_long] survival range
+# across psi in [0.2,0.8] -- a steep but continuous sigmoid, not a step function.
+# Asymmetric extreme combinations (e.g. s1=10, s2=0.1) have ~5-6% prior mass and are
+# biologically implausible, but acceptable given the strong empirical evidence for extension.
 priors_default$parameters_global$decay_shape_2 <- list(
      description = "Second shape parameter of Beta distribution for V. cholerae decay",
      distribution = "uniform",
-     parameters = list(min = 0.5, max = 5.0)
+     parameters = list(min = 0.1, max = 10.0)
 )
 
 # epsilon - Natural immunity waning rate
@@ -116,10 +148,18 @@ priors_default$parameters_global$iota <- list(
 # No variance inflation for iota (factor = 1)
 
 # kappa - Concentration of V. cholerae which leads to 50% infectious dose
+# Fixed near the config_default and laser-cholera default of 1e6.
+# Kappa is structurally unidentifiable alongside zeta and beta_env from case
+# data alone (Lee et al. 2017); standard practice in the cholera modeling
+# literature (Codeço 2001, Hartley 2006) is to fix it. We use a tight
+# Lognormal prior with mode exactly at 1e6 and sdlog=0.25.
+# For lognormal: mode = exp(meanlog - sdlog^2), so
+#   meanlog = log(1e6) + sdlog^2 = log(1e6) + 0.0625
+# This gives 95% CI approximately [626k, 1.60M].
 priors_default$parameters_global$kappa <- list(
      description = "Concentration of V. cholerae for 50% infectious dose",
-     distribution = "uniform",
-     parameters = list(min = 10^6, max = 10^9)
+     distribution = "lognormal",
+     parameters = list(meanlog = log(10^6) + 0.25^2, sdlog = 0.25)
 )
 
 
@@ -335,74 +375,82 @@ priors_default$parameters_global$phi_2 <- list(
 
 
 
-# Configuration parameter for rho (reporting rate)
-# Set outbreak = TRUE to use high estimate (during outbreaks, ~78% mean)
-# Set outbreak = FALSE to use low estimate (all settings, ~52% mean)
-outbreak <- FALSE  # Default to outbreak scenario for active transmission modeling
+# ---- chi_endemic and chi_epidemic (PPV of clinical case definition) ----
+# Beta distribution parameters from Weins et al. 2023 (PLOS Medicine,
+# doi:10.1371/journal.pmed.1004286), fit in get_suspected_cases().
+# Low estimate (all settings) -> chi_endemic; High estimate (outbreaks) -> chi_epidemic.
+chi_param_file <- file.path(PATHS$MODEL_INPUT, "param_chi_suspected_cases.csv")
+if (file.exists(chi_param_file)) {
+     param_chi <- read.csv(chi_param_file)
 
-# Load rho (reporting rate) parameters
-# Check if file exists first
-rho_param_file <- file.path(PATHS$MODEL_INPUT, "param_rho_suspected_cases.csv")
-if (file.exists(rho_param_file)) {
-     param_rho <- read.csv(rho_param_file)
+     chi_endemic_shape1 <- param_chi$parameter_value[
+          grepl("chi_endemic.*Low estimate", param_chi$variable_description) &
+               param_chi$parameter_name == "shape1"
+     ]
+     chi_endemic_shape2 <- param_chi$parameter_value[
+          grepl("chi_endemic.*Low estimate", param_chi$variable_description) &
+               param_chi$parameter_name == "shape2"
+     ]
+     chi_epidemic_shape1 <- param_chi$parameter_value[
+          grepl("chi_epidemic.*High estimate", param_chi$variable_description) &
+               param_chi$parameter_name == "shape1"
+     ]
+     chi_epidemic_shape2 <- param_chi$parameter_value[
+          grepl("chi_epidemic.*High estimate", param_chi$variable_description) &
+               param_chi$parameter_name == "shape2"
+     ]
 
-     # Select parameters based on outbreak setting
-     if (outbreak) {
-          # Extract high estimate parameters (during outbreaks)
-          # Mean ~78%, appropriate for active outbreak modeling
-          rho_shape1 <- param_rho$parameter_value[
-               grepl("High estimate", param_rho$variable_description) &
-                    param_rho$parameter_name == "shape1"
-          ]
-          rho_shape2 <- param_rho$parameter_value[
-               grepl("High estimate", param_rho$variable_description) &
-                    param_rho$parameter_name == "shape2"
-          ]
-          rho_description <- "High estimate (during outbreaks)"
-
-          # Default values for high estimate if not found
-          default_shape1 <- 4.79
-          default_shape2 <- 1.53
-     } else {
-          # Extract low estimate parameters (all settings)
-          # Mean ~52%, appropriate for endemic/inter-outbreak periods
-          rho_shape1 <- param_rho$parameter_value[
-               grepl("Low estimate", param_rho$variable_description) &
-                    param_rho$parameter_name == "shape1"
-          ]
-          rho_shape2 <- param_rho$parameter_value[
-               grepl("Low estimate", param_rho$variable_description) &
-                    param_rho$parameter_name == "shape2"
-          ]
-          rho_description <- "Low estimate (all settings)"
-
-          # Default values for low estimate if not found
-          default_shape1 <- 5.43
-          default_shape2 <- 5.01
+     if (length(chi_endemic_shape1) == 0 || length(chi_endemic_shape2) == 0) {
+          warning("Could not extract chi_endemic shape params from file. Using defaults.")
+          chi_endemic_shape1 <- 5.43
+          chi_endemic_shape2 <- 5.01
      }
-
-     if (length(rho_shape1) == 0 || length(rho_shape2) == 0) {
-          warning(paste("Could not find rho parameters for", rho_description, "in file. Using defaults."))
-          rho_shape1 <- default_shape1
-          rho_shape2 <- default_shape2
+     if (length(chi_epidemic_shape1) == 0 || length(chi_epidemic_shape2) == 0) {
+          warning("Could not extract chi_epidemic shape params from file. Using defaults.")
+          chi_epidemic_shape1 <- 4.79
+          chi_epidemic_shape2 <- 1.53
      }
 } else {
-     warning("Rho parameter file not found. Using default values.")
-     if (outbreak) {
-          rho_shape1 <- 4.79  # High estimate defaults
-          rho_shape2 <- 1.53
-          rho_description <- "High estimate (during outbreaks) - DEFAULT"
-     } else {
-          rho_shape1 <- 5.43  # Low estimate defaults
-          rho_shape2 <- 5.01
-          rho_description <- "Low estimate (all settings) - DEFAULT"
-     }
+     warning("Chi PPV parameter file not found. Using default values.")
+     chi_endemic_shape1  <- 5.43;  chi_endemic_shape2  <- 5.01
+     chi_epidemic_shape1 <- 4.79;  chi_epidemic_shape2 <- 1.53
 }
 
-# rho - Reporting rate (proportion of suspected cases that are true cholera)
-# Using selected estimate based on outbreak parameter
+# chi_endemic - PPV among suspected cases during endemic periods (Weins et al. 2023 low estimate)
+# Beta(5.43, 5.01) -> median ~0.52, 95% CI [0.24, 0.80]
+priors_default$parameters_global$chi_endemic <- list(
+     description = "PPV among suspected cases during endemic periods (Weins et al. 2023, all settings)",
+     distribution = "beta",
+     parameters = list(shape1 = chi_endemic_shape1, shape2 = chi_endemic_shape2)
+)
+
+# chi_epidemic - PPV among suspected cases during epidemic periods (Weins et al. 2023 high estimate)
+# Beta(4.79, 1.53) -> median ~0.78, 95% CI [0.40, 0.99]
+priors_default$parameters_global$chi_epidemic <- list(
+     description = "PPV among suspected cases during epidemic periods (Weins et al. 2023, during outbreaks)",
+     distribution = "beta",
+     parameters = list(shape1 = chi_epidemic_shape1, shape2 = chi_epidemic_shape2)
+)
+
+# rho - Care-seeking rate (probability a symptomatic infection presents as a suspected case)
+# Fitted from GEMS (Nasrin et al. 2013, PMC3748499) and Wiens et al. 2025 (PMC12013865)
+# via get_rho_care_seeking_params().  Values read from param_rho_care_seeking.csv.
+rho_param_file <- file.path(PATHS$MODEL_INPUT, "param_rho_care_seeking.csv")
+if (file.exists(rho_param_file)) {
+     param_rho    <- read.csv(rho_param_file, stringsAsFactors = FALSE)
+     rho_shape1   <- param_rho$parameter_value[param_rho$parameter_name == "shape1"]
+     rho_shape2   <- param_rho$parameter_value[param_rho$parameter_name == "shape2"]
+     if (length(rho_shape1) == 0 || length(rho_shape2) == 0) {
+          warning("Could not extract rho shape params from file. Using Beta(3, 7) fallback.")
+          rho_shape1 <- 3.0; rho_shape2 <- 7.0
+     }
+} else {
+     warning("param_rho_care_seeking.csv not found. Using Beta(3, 7) fallback.")
+     rho_shape1 <- 3.0; rho_shape2 <- 7.0
+}
+
 priors_default$parameters_global$rho <- list(
-     description = "Reporting rate (proportion of suspected cases that are true cholera)",
+     description = "Care-seeking rate: probability a symptomatic infection is reported as suspected (GEMS + Wiens 2025)",
      distribution = "beta",
      parameters = list(shape1 = rho_shape1, shape2 = rho_shape2)
 )
@@ -414,34 +462,49 @@ priors_default$parameters_global$sigma <- list(
      parameters = list(shape1 = 4.30, shape2 = 13.51)
 )
 
-# zeta_1 - Symptomatic shedding rate
+# zeta_1 - Symptomatic shedding rate (bacteria per infected person per day, LASER total-count units)
+# Equilibrium analysis: W_eq = zeta_1 * Isym * (1-theta) / delta. With kappa fixed at 1e6,
+# delta=1/30, Isym=1000, theta=0.5, the linear-saturation transition occurs at zeta_1* ~ 33.
+# Prior centered at median=100 (3x above transition) with sdlog=3.0 gives approximately
+# equal mass across regimes: ~36% linear (zeta<33), ~30% transition (33-330),
+# ~32% mild saturation (330-33k), ~3% strong saturation (>33k).
+# 95% CI=[0.28, 35777]; LASER default (7.5) at ~19th percentile.
 priors_default$parameters_global$zeta_1 <- list(
-     description = "Symptomatic shedding rate (bacteria per day)",
-     distribution = "uniform",
-     parameters = list(min = 1e5, max = 1e10)
+     description = "Symptomatic shedding rate (total bacteria per infected person per day)",
+     distribution = "lognormal",
+     parameters = list(meanlog = log(100), sdlog = 3.0)
 )
 
-# zeta_2 - Asymptomatic shedding rate
+# zeta_2 - Asymptomatic shedding rate (bacteria per infected person per day, LASER total-count units)
+# Maintains ~10:1 ratio to zeta_1 (symptomatic individuals shed substantially more).
+# Median=10, sdlog=3.0 matches zeta_1 breadth; 95% CI=[0.03, 3578].
+# LASER default (2.5) at ~32nd percentile.
 priors_default$parameters_global$zeta_2 <- list(
-     description = "Asymptomatic shedding rate (bacteria per day)",
-     distribution = "uniform",
-     parameters = list(min = 100, max = 1e5)
+     description = "Asymptomatic shedding rate (total bacteria per infected person per day)",
+     distribution = "lognormal",
+     parameters = list(meanlog = log(10), sdlog = 3.0)
 )
 
-# delta_reporting_cases - Infection-to-case reporting delay
-# This corresponds to the delta_t parameter in calc_cases_from_infections()
+# delta_reporting_cases - Symptom-onset-to-case reporting delay
+# Incubation is already handled by the E compartment (iota parameter); this
+# captures only the lag from symptom onset to surveillance report.
+# Prior: TruncNorm(mean=2, sd=2, a=0, b=7) — mode near 1-2 days, hard ceiling at 7.
+# Sampled value is rounded to the nearest integer before passing to make_LASER_config().
 priors_default$parameters_global$delta_reporting_cases <- list(
-     description = "Infection-to-case reporting delay in days",
-     distribution = "discrete_uniform",
-     parameters = list(min = 0, max = 7)
+     description = "Symptom-onset-to-case reporting delay in days (integer, 0-7)",
+     distribution = "truncnorm",
+     parameters = list(mean = 2, sd = 2, a = 0, b = 7)
 )
 
-# delta_reporting_deaths - Infection-to-death reporting delay
-# This corresponds to the delta_t parameter in calc_deaths_from_infections()
+# delta_reporting_deaths - Symptom-onset-to-death reporting delay
+# Incubation is already handled by the E compartment (iota parameter); this
+# captures the lag from symptom onset through clinical progression to death report.
+# Prior: TruncNorm(mean=4, sd=3, a=0, b=14) — mode near 3-5 days, hard ceiling at 14.
+# Sampled value is rounded to the nearest integer before passing to make_LASER_config().
 priors_default$parameters_global$delta_reporting_deaths <- list(
-     description = "Infection-to-death reporting delay in days",
-     distribution = "discrete_uniform",
-     parameters = list(min = 0, max = 14)
+     description = "Symptom-onset-to-death reporting delay in days (integer, 0-14)",
+     distribution = "truncnorm",
+     parameters = list(mean = 4, sd = 3, a = 0, b = 14)
 )
 
 
@@ -1041,32 +1104,28 @@ initial_conditions_E_I <- est_initial_E_I(
 # Apply scaling factors to reduce mean E and I while preserving relative uncertainty
 
 adjustment_factors_E_I <- list(
-     MOZ = 0.4,  # Reduce Mozambique initial E/I to 30% of estimated
-     MWI = 0.3,  # Reduce Malawi initial E/I to 20% of estimated
-     ZWE = 0.075,  # Reduce Zimbabwe initial E/I to 15% of estimated
-     UGA = 0.05,
-     TZA = 0.05,
-     SOM = 0.3,
      AGO = 0.01,
      BEN = 0.01,
      BFA = 0.01,
-     BWA = 0.00,
+     BWA = 0.00,  # Near-zero: no active cholera at model start (uses Beta(0.01, 99999.99))
      CAF = 0.01,
      CIV = 0.01,
      CMR = 0.01,
      COD = 0.75,
      COG = 0.05,
-     ERI = 0.00,
-     GAB = 0.00,
+     ERI = 0.00,  # Near-zero: very limited international data; no active cholera
+     GAB = 0.00,  # Near-zero: no active cholera at model start
      GHA = 0.001,
      GIN = 0.001,
-     GMB = 0.000,
+     GMB = 0.001,
      GNB = 0.001,
-     GNQ = 0.00,
+     GNQ = 0.00,  # Near-zero: no active cholera at model start
      KEN = 1.2,
      LBR = 0.001,
-     MLI = 0.00,
-     MRT = 0.00,
+     MLI = 0.00,  # Near-zero: no active cholera at model start
+     MOZ = 0.4,
+     MRT = 0.00,  # Near-zero: no active cholera at model start
+     MWI = 0.3,
      NAM = 0.2,
      NER = 0.1,
      NGA = 1.1,
@@ -1075,12 +1134,14 @@ adjustment_factors_E_I <- list(
      SLE = 0.001,
      SOM = 0.5,
      SSD = 0.1,
-     SWZ = 0.00,
+     SWZ = 0.00,  # Near-zero: no active cholera at model start
      TCD = 0.001,
      TGO = 0.1,
      TZA = 0.05,
      UGA = 0.3,
-     ZAF = 0.01
+     ZAF = 0.01,
+     ZMB = 0.3,
+     ZWE = 0.075
 )
 
 cat("\nApplying post-estimation mean adjustments for initial E and I:\n")
@@ -1093,31 +1154,44 @@ for (iso in names(adjustment_factors_E_I)) {
           old_params_E <- priors_default$parameters_location$prop_E_initial$location[[iso]]$parameters
           old_mean_E <- old_params_E$shape1 / (old_params_E$shape1 + old_params_E$shape2)
 
-          # Calculate new mean (scaled down)
-          new_mean_E <- old_mean_E * scaling_factor
+          if (scaling_factor == 0) {
+               # Zero scaling: no active E at model start.
+               # Cannot compute new Beta via mean/CV rescale (0/0 = NaN).
+               # Use the minimum-mass default prior instead: Beta(0.01, 99999.99)
+               # gives mean ~1e-7, placing virtually all mass at 0.
+               priors_default$parameters_location$prop_E_initial$location[[iso]]$parameters <- list(
+                    shape1 = 0.01,
+                    shape2 = 99999.99
+               )
+               cat(sprintf("  %s E: %.6f -> ~0 (near-zero prior, 100%% reduction)\n",
+                           iso, old_mean_E))
+          } else {
+               # Calculate new mean (scaled down)
+               new_mean_E <- old_mean_E * scaling_factor
 
-          # Preserve relative uncertainty (CV)
-          # CV = sqrt(variance) / mean for Beta distribution
-          old_var_E <- (old_params_E$shape1 * old_params_E$shape2) /
-                       ((old_params_E$shape1 + old_params_E$shape2)^2 *
-                        (old_params_E$shape1 + old_params_E$shape2 + 1))
-          old_cv_E <- sqrt(old_var_E) / old_mean_E
+               # Preserve relative uncertainty (CV)
+               # CV = sqrt(variance) / mean for Beta distribution
+               old_var_E <- (old_params_E$shape1 * old_params_E$shape2) /
+                            ((old_params_E$shape1 + old_params_E$shape2)^2 *
+                             (old_params_E$shape1 + old_params_E$shape2 + 1))
+               old_cv_E <- sqrt(old_var_E) / old_mean_E
 
-          # Fit new Beta with scaled mean and same CV
-          new_var_E <- (new_mean_E * old_cv_E)^2
+               # Fit new Beta with scaled mean and same CV
+               new_var_E <- (new_mean_E * old_cv_E)^2
 
-          # Beta parameters from mean and variance
-          common_term_E <- new_mean_E * (1 - new_mean_E) / new_var_E - 1
-          new_shape1_E <- max(0.01, new_mean_E * common_term_E)
-          new_shape2_E <- max(0.01, (1 - new_mean_E) * common_term_E)
+               # Beta parameters from mean and variance
+               common_term_E <- new_mean_E * (1 - new_mean_E) / new_var_E - 1
+               new_shape1_E <- max(0.01, new_mean_E * common_term_E)
+               new_shape2_E <- max(0.01, (1 - new_mean_E) * common_term_E)
 
-          priors_default$parameters_location$prop_E_initial$location[[iso]]$parameters <- list(
-               shape1 = new_shape1_E,
-               shape2 = new_shape2_E
-          )
+               priors_default$parameters_location$prop_E_initial$location[[iso]]$parameters <- list(
+                    shape1 = new_shape1_E,
+                    shape2 = new_shape2_E
+               )
 
-          cat(sprintf("  %s E: %.6f -> %.6f (%.0f%% reduction)\n",
-                      iso, old_mean_E, new_mean_E, (1 - scaling_factor) * 100))
+               cat(sprintf("  %s E: %.6f -> %.6f (%.0f%% reduction)\n",
+                           iso, old_mean_E, new_mean_E, (1 - scaling_factor) * 100))
+          }
      }
 
      # Adjust prop_I_initial
@@ -1125,30 +1199,41 @@ for (iso in names(adjustment_factors_E_I)) {
           old_params_I <- priors_default$parameters_location$prop_I_initial$location[[iso]]$parameters
           old_mean_I <- old_params_I$shape1 / (old_params_I$shape1 + old_params_I$shape2)
 
-          # Calculate new mean (scaled down)
-          new_mean_I <- old_mean_I * scaling_factor
+          if (scaling_factor == 0) {
+               # Zero scaling: no active I at model start.
+               # Use the minimum-mass default prior: Beta(0.01, 99999.99) ~ mean 1e-7.
+               priors_default$parameters_location$prop_I_initial$location[[iso]]$parameters <- list(
+                    shape1 = 0.01,
+                    shape2 = 99999.99
+               )
+               cat(sprintf("  %s I: %.6f -> ~0 (near-zero prior, 100%% reduction)\n",
+                           iso, old_mean_I))
+          } else {
+               # Calculate new mean (scaled down)
+               new_mean_I <- old_mean_I * scaling_factor
 
-          # Preserve relative uncertainty (CV)
-          old_var_I <- (old_params_I$shape1 * old_params_I$shape2) /
-                       ((old_params_I$shape1 + old_params_I$shape2)^2 *
-                        (old_params_I$shape1 + old_params_I$shape2 + 1))
-          old_cv_I <- sqrt(old_var_I) / old_mean_I
+               # Preserve relative uncertainty (CV)
+               old_var_I <- (old_params_I$shape1 * old_params_I$shape2) /
+                            ((old_params_I$shape1 + old_params_I$shape2)^2 *
+                             (old_params_I$shape1 + old_params_I$shape2 + 1))
+               old_cv_I <- sqrt(old_var_I) / old_mean_I
 
-          # Fit new Beta with scaled mean and same CV
-          new_var_I <- (new_mean_I * old_cv_I)^2
+               # Fit new Beta with scaled mean and same CV
+               new_var_I <- (new_mean_I * old_cv_I)^2
 
-          # Beta parameters from mean and variance
-          common_term_I <- new_mean_I * (1 - new_mean_I) / new_var_I - 1
-          new_shape1_I <- max(0.01, new_mean_I * common_term_I)
-          new_shape2_I <- max(0.01, (1 - new_mean_I) * common_term_I)
+               # Beta parameters from mean and variance
+               common_term_I <- new_mean_I * (1 - new_mean_I) / new_var_I - 1
+               new_shape1_I <- max(0.01, new_mean_I * common_term_I)
+               new_shape2_I <- max(0.01, (1 - new_mean_I) * common_term_I)
 
-          priors_default$parameters_location$prop_I_initial$location[[iso]]$parameters <- list(
-               shape1 = new_shape1_I,
-               shape2 = new_shape2_I
-          )
+               priors_default$parameters_location$prop_I_initial$location[[iso]]$parameters <- list(
+                    shape1 = new_shape1_I,
+                    shape2 = new_shape2_I
+               )
 
-          cat(sprintf("  %s I: %.6f -> %.6f (%.0f%% reduction)\n",
-                      iso, old_mean_I, new_mean_I, (1 - scaling_factor) * 100))
+               cat(sprintf("  %s I: %.6f -> %.6f (%.0f%% reduction)\n",
+                           iso, old_mean_I, new_mean_I, (1 - scaling_factor) * 100))
+          }
      }
 }
 
@@ -1539,6 +1624,9 @@ for (iso in j) {
 }
 
 # mu_j_epidemic_factor - Proportional IFR increase during epidemics
+# Gamma(shape=1, rate=2): mode=0 (no epidemic effect most probable), mean=0.5,
+# 95th pct ~1.5. Encodes weakly informative belief that epidemic-mode CFR increase
+# is modest but uncertain, with exponential decay away from zero.
 priors_default$parameters_location$mu_j_epidemic_factor <- list(
      description = "Proportional increase in IFR during epidemic periods (e.g., 0.5 = 50% increase)",
      location = list()
@@ -1546,98 +1634,146 @@ priors_default$parameters_location$mu_j_epidemic_factor <- list(
 
 for (iso in j) {
      priors_default$parameters_location$mu_j_epidemic_factor$location[[iso]] <- list(
-          distribution = "lognormal",
+          distribution = "gamma",
           parameters = list(
-               meanlog = log(0.5),  # Median: 50% increase
-               sdlog = 0.7          # 95% CI: ~10% to 200% increase
+               shape = 1,  # Exponential: mode=0, most mass near zero
+               rate  = 2   # Mean=0.5, 95th pct ~1.5
           )
      )
 }
 
-# epidemic_threshold - Location-specific epidemic threshold
+# epidemic_threshold - Location-specific epidemic regime activation threshold
+#
+# Units: dimensionless daily Isym/N point prevalence fraction.
+# The LASER engine compares epidemic_threshold against
+#   Isym[t - delta_reporting_cases] / N[t - delta_reporting_cases]
+# at every daily tick to decide whether to apply epidemic-mode IFR and chi_epidemic.
+#
+# Derivation of prior means:
+#   Reported weekly incidence (cases/100k/wk) is converted to Isym/N via:
+#     Isym/N = (reported_per_100k / 1e5) * (chi_endemic / rho) / (7 * gamma_1)
+#   (Little's Law under approximate steady state; sdlog = 0.5 captures factor-of-2
+#    uncertainty from this approximation.)
+#
+# Data source: PATHS$DATA_PROCESSED cholera/weekly/cholera_surveillance_weekly_combined.csv
+#   Median weekly reported incidence per 100k across outbreak-positive weeks (cases > 0).
+#   Countries with < 10 outbreak weeks use the Zheng global reference (0.7/100k/wk),
+#   the published SSA median from Zheng et al. (2022) IJID.
+#
+# Distribution: Lognormal(meanlog = log(prior_mean), sdlog = 0.5)
+
+# Helper: convert Zheng weekly reported incidence to Isym/N point prevalence
+convert_zheng_threshold <- function(zheng_weekly_per_100k, rho, chi, gamma_1) {
+     (zheng_weekly_per_100k / 1e5) * (chi / rho) / (7 * gamma_1)
+}
+
+# Extract model parameters from config — do NOT hardcode these values
+rho_val    <- config_default$rho
+chi_val    <- config_default$chi_endemic
+gamma1_val <- config_default$gamma_1
+
+# Compute per-country median weekly incidence per 100k during outbreak-positive weeks.
+# Cap the population join year at the maximum available year in demographics (2024)
+# to handle surveillance records in 2025 that have no matching population row.
+dem_max_year  <- max(dem_annual$year)
+
+outbreak_rows <- surv_weekly[
+     surv_weekly$iso_code %in% j &
+     !is.na(surv_weekly$cases) &
+     surv_weekly$cases > 0,
+]
+outbreak_rows$dem_year <- pmin(outbreak_rows$year, dem_max_year)
+
+merged_surv <- merge(
+     outbreak_rows,
+     dem_annual[, c("iso_code", "year", "population")],
+     by.x = c("iso_code", "dem_year"),
+     by.y = c("iso_code", "year"),
+     all.x = TRUE
+)
+merged_surv$weekly_incidence_per_100k <- merged_surv$cases / merged_surv$population * 1e5
+
+# Per-country summary: outbreak week count and median weekly incidence per 100k
+country_threshold_data <- do.call(rbind, lapply(j, function(iso) {
+     rows <- merged_surv[
+          merged_surv$iso_code == iso &
+          !is.na(merged_surv$weekly_incidence_per_100k),
+     ]
+     data.frame(
+          iso_code                  = iso,
+          n_outbreak_weeks          = nrow(rows),
+          median_incidence_per_100k = if (nrow(rows) > 0) median(rows$weekly_incidence_per_100k, na.rm = TRUE) else NA_real_,
+          stringsAsFactors          = FALSE
+     )
+}))
+
+# Countries with < 10 outbreak weeks fall back to the Zheng global SSA reference value.
+# 0.7 per 100k per week is the published median from Zheng et al. (2022) IJID across
+# SSA districts — a conservative (upper-side) choice for low-burden / data-sparse countries.
+ZHENG_GLOBAL_FALLBACK_PER_100K   <- 0.7
+MIN_OUTBREAK_WEEKS_FOR_DATA_PRIOR <- 10
+
+country_threshold_data$use_fallback <- (
+     country_threshold_data$n_outbreak_weeks < MIN_OUTBREAK_WEEKS_FOR_DATA_PRIOR |
+     is.na(country_threshold_data$median_incidence_per_100k)
+)
+
+country_threshold_data$prior_mean <- ifelse(
+     !country_threshold_data$use_fallback,
+     convert_zheng_threshold(
+          country_threshold_data$median_incidence_per_100k,
+          rho_val, chi_val, gamma1_val
+     ),
+     convert_zheng_threshold(
+          ZHENG_GLOBAL_FALLBACK_PER_100K,
+          rho_val, chi_val, gamma1_val
+     )
+)
+
+EPIDEMIC_THRESHOLD_SDLOG <- 0.5   # captures ~factor-of-2 uncertainty around Zheng conversion
+
 priors_default$parameters_location$epidemic_threshold <- list(
-     description = "Incidence threshold (infections per capita) for epidemic definition",
+     description = paste0(
+          "Dimensionless daily Isym/N prevalence threshold for epidemic regime activation. ",
+          "Compared against Isym[t - delta_reporting_cases] / N[t - delta_reporting_cases] in LASER. ",
+          "Derived from observed median weekly reported incidence per 100k (outbreak-positive weeks) ",
+          "converted via Zheng formula using config rho, chi_endemic, and gamma_1. ",
+          "Lognormal(meanlog = log(prior_mean), sdlog = 0.5)."
+     ),
      location = list()
 )
 
-# Define location-specific thresholds based on healthcare capacity (per 100,000)
-epidemic_threshold_by_country <- c(
-     "AGO" = 20,  # Angola
-     "BDI" = 15,  # Burundi
-     "BEN" = 20,  # Benin
-     "BFA" = 15,  # Burkina Faso
-     "BWA" = 40,  # Botswana - good healthcare
-     "CAF" = 10,  # Central African Republic - limited capacity
-     "CIV" = 25,  # Côte d'Ivoire
-     "CMR" = 25,  # Cameroon
-     "COD" = 15,  # Democratic Republic of Congo
-     "COG" = 20,  # Congo
-     "ERI" = 15,  # Eritrea
-     "ETH" = 20,  # Ethiopia
-     "GAB" = 30,  # Gabon
-     "GHA" = 30,  # Ghana - good healthcare
-     "GIN" = 20,  # Guinea
-     "GMB" = 20,  # Gambia
-     "GNB" = 15,  # Guinea-Bissau
-     "GNQ" = 25,  # Equatorial Guinea
-     "KEN" = 35,  # Kenya - good surveillance
-     "LBR" = 20,  # Liberia
-     "MLI" = 20,  # Mali
-     "MOZ" = 20,  # Mozambique
-     "MRT" = 15,  # Mauritania
-     "MWI" = 25,  # Malawi
-     "NAM" = 35,  # Namibia - good healthcare
-     "NER" = 15,  # Niger
-     "NGA" = 25,  # Nigeria
-     "RWA" = 40,  # Rwanda - excellent healthcare
-     "SEN" = 30,  # Senegal
-     "SLE" = 20,  # Sierra Leone
-     "SOM" = 10,  # Somalia - very limited capacity
-     "SSD" = 10,  # South Sudan - conflict affected
-     "SWZ" = 30,  # Eswatini
-     "TCD" = 15,  # Chad
-     "TGO" = 20,  # Togo
-     "TZA" = 25,  # Tanzania
-     "UGA" = 30,  # Uganda
-     "ZAF" = 50,  # South Africa - excellent healthcare
-     "ZMB" = 30,  # Zambia
-     "ZWE" = 20   # Zimbabwe
-)
-
 for (iso in j) {
-     # Get location-specific threshold or use default
-     threshold_per_100k <- ifelse(
-          iso %in% names(epidemic_threshold_by_country),
-          epidemic_threshold_by_country[iso],
-          25  # Default: 25 per 100,000
-     )
-
-     # Convert to per capita
-     threshold_mean <- threshold_per_100k / 100000
-
-     # Create beta distribution centered on this value with some uncertainty
-     # Use method of moments for Beta distribution
-     # Mean = threshold_mean, CV = 0.2 (20% coefficient of variation)
-     cv <- 0.2
-     variance <- (threshold_mean * cv)^2
-
-     # Beta parameters from mean and variance
-     # Mean = a/(a+b), Var = ab/((a+b)^2(a+b+1))
-     common_term <- threshold_mean * (1 - threshold_mean) / variance - 1
-     shape1 <- threshold_mean * common_term
-     shape2 <- (1 - threshold_mean) * common_term
-
-     # Ensure reasonable bounds
-     shape1 <- max(shape1, 2)
-     shape2 <- max(shape2, 2)
-
+     idx <- which(country_threshold_data$iso_code == iso)
      priors_default$parameters_location$epidemic_threshold$location[[iso]] <- list(
-          distribution = "beta",
-          parameters = list(
-               shape1 = shape1,
-               shape2 = shape2
+          distribution = "lognormal",
+          parameters   = list(
+               meanlog = log(country_threshold_data$prior_mean[idx]),
+               sdlog   = EPIDEMIC_THRESHOLD_SDLOG
           )
      )
+}
+
+# Verification summary
+n_data_prior <- sum(!country_threshold_data$use_fallback)
+n_fallback   <- sum(country_threshold_data$use_fallback)
+all_ml <- sapply(j, function(iso)
+     priors_default$parameters_location$epidemic_threshold$location[[iso]]$parameters$meanlog)
+
+cat(sprintf(
+     "\n[epidemic_threshold priors] Data-derived: %d | Fallback: %d | Total: %d\n",
+     n_data_prior, n_fallback, length(j)
+))
+cat(sprintf(
+     "[epidemic_threshold priors] prior_mean range: [%.2e, %.2e]\n",
+     exp(min(all_ml)), exp(max(all_ml))
+))
+for (iso in c("ETH", "COD", "SLE", "BWA")) {
+     pm <- priors_default$parameters_location$epidemic_threshold$location[[iso]]$parameters$meanlog
+     ps <- priors_default$parameters_location$epidemic_threshold$location[[iso]]$parameters$sdlog
+     fb <- if (country_threshold_data$use_fallback[country_threshold_data$iso_code == iso]) " [fallback]" else ""
+     cat(sprintf("  %s%s: median=%.2e  95%% CI=[%.2e, %.2e]\n",
+                 iso, fb, exp(pm), exp(pm - 1.96 * ps), exp(pm + 1.96 * ps)))
 }
 
 #----------------------------------------
@@ -1652,10 +1788,12 @@ priors_default$parameters_location$psi_star_a <- list(
 
 for (iso in j) {
      priors_default$parameters_location$psi_star_a$location[[iso]] <- list(
-          distribution = "lognormal",
+          distribution = "truncnorm",
           parameters = list(
-               meanlog = 0,     # Mean ~1.16, median = 1.0 (no transformation)
-               sdlog = 0.9      # 95% CI: [0.30, 3.30], allows more flexible shape changes
+               mean = 1,    # Neutral value: a=1 is identity (no transformation); mode=1
+               sd   = 1.0,  # 95% CI: ~[0.08, 3.03]; P(a>2)=18.9% matches old Lognormal(0,0.9) at 22.1%
+               a    = 0,    # Lower bound enforces a > 0 (required by calc_psi_star)
+               b    = Inf   # No upper bound
           )
      )
 }
@@ -1671,7 +1809,7 @@ for (iso in j) {
           distribution = "normal",
           parameters = list(
                mean = 0,        # Centered at no offset
-               sd = 2.0       # 95% CI: [-2.45, 2.45], allows larger baseline shifts
+               sd = 2.5         # 95% CI: [-4.90, 4.90]; old posterior lower tail (-4.65) was below sd=2.0 95th
           )
      )
 }
@@ -1686,8 +1824,8 @@ for (iso in j) {
      priors_default$parameters_location$psi_star_z$location[[iso]] <- list(
           distribution = "beta",
           parameters = list(
-               shape1 = 1,      # Mean: 0.75, Mode: 1.0
-               shape2 = 1       # 95% CI: [0.21, 1.00], allows more smoothing flexibility
+               shape1 = 1,      # Beta(1,1): uniform on [0,1]; no prior preference for smoothing level
+               shape2 = 1       # Old posterior (MOZ) median=0.56, 95% CI=[0.07, 0.95] -- full range used
           )
      )
 }
@@ -1702,10 +1840,10 @@ for (iso in j) {
      priors_default$parameters_location$psi_star_k$location[[iso]] <- list(
           distribution = "truncnorm",
           parameters = list(
-               mean = 0,        # Centered at no offset
-               sd = 25,         # Standard deviation of 15 days (increased from 10)
-               a = -90,         # Lower bound: -60 days (increased from -45)
-               b = 90           # Upper bound: +60 days (increased from 45)
+               mean = 0,        # Centered at no offset (no assumed lag direction)
+               sd = 25,         # Wide enough to explore 0 to -90 days
+               a = -90,         # Lower bound: -90 days
+               b = 0            # Upper bound: k<=0 enforces advance-only (corrects NN forward-timing offset)
           )
      )
 }

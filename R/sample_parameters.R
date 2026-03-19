@@ -22,16 +22,18 @@
 #'     \item sample_epsilon: Immunity (default TRUE)
 #'     \item sample_gamma_1: Recovery rate (default TRUE)
 #'     \item sample_gamma_2: Recovery rate (default TRUE)
-#'     \item sample_iota: Importation rate (default TRUE)
-#'     \item sample_kappa: Spatial correlation (default TRUE)
-#'     \item sample_mobility_gamma: Mobility parameter (default TRUE)
-#'     \item sample_mobility_omega: Mobility parameter (default TRUE)
-#'     \item sample_omega_1: Infection (default TRUE)
-#'     \item sample_omega_2: Infection (default TRUE)
-#'     \item sample_phi_1: Incubation (default TRUE)
-#'     \item sample_phi_2: Incubation (default TRUE)
-#'     \item sample_rho: Immunity waning (default TRUE)
-#'     \item sample_sigma: Immunity (default TRUE)
+#'     \item sample_iota: Incubation rate (default TRUE)
+#'     \item sample_kappa: V. cholerae 50 percent infectious dose concentration (default TRUE)
+#'     \item sample_mobility_gamma: Mobility distance decay parameter (default TRUE)
+#'     \item sample_mobility_omega: Mobility population scaling parameter (default TRUE)
+#'     \item sample_omega_1: Vaccine waning rate one dose (default TRUE)
+#'     \item sample_omega_2: Vaccine waning rate two doses (default TRUE)
+#'     \item sample_phi_1: Initial vaccine effectiveness one dose (default TRUE)
+#'     \item sample_phi_2: Initial vaccine effectiveness two doses (default TRUE)
+#'     \item sample_chi_endemic: PPV among suspected cases during endemic periods (default TRUE)
+#'     \item sample_chi_epidemic: PPV among suspected cases during epidemic periods (default TRUE)
+#'     \item sample_rho: Care-seeking rate (default TRUE)
+#'     \item sample_sigma: Symptomatic fraction (default TRUE)
 #'     \item sample_zeta_1: Spatial (default TRUE)
 #'     \item sample_zeta_2: Spatial (default TRUE)
 #'     \item sample_beta_j0_tot: Total transmission rate (default TRUE)
@@ -42,7 +44,12 @@
 #'     \item sample_a2: Seasonality (default TRUE)
 #'     \item sample_b1: Seasonality (default TRUE)
 #'     \item sample_b2: Seasonality (default TRUE)
-#'     \item sample_mu_j: Location-specific case fatality ratio (default TRUE)
+#'     \item sample_mu_j_baseline: Location-specific baseline IFR (default TRUE)
+#'     \item sample_mu_j_slope: Location-specific temporal IFR trend (default TRUE)
+#'     \item sample_mu_j_epidemic_factor: Location-specific epidemic IFR multiplier (default TRUE)
+#'     \item sample_epidemic_threshold: Location-specific epidemic activation threshold (default TRUE)
+#'     \item sample_delta_reporting_cases: Infection-to-case reporting delay in days (default TRUE)
+#'     \item sample_delta_reporting_deaths: Infection-to-death reporting delay in days (default TRUE)
 #'     \item sample_psi_star_a: Suitability calibration shape/gain (default TRUE)
 #'     \item sample_psi_star_b: Suitability calibration scale/offset (default TRUE)
 #'     \item sample_psi_star_z: Suitability calibration smoothing (default TRUE)
@@ -126,12 +133,14 @@ sample_parameters <- function(
     sample_omega_2 = TRUE,
     sample_phi_1 = TRUE,
     sample_phi_2 = TRUE,
+    sample_chi_endemic = TRUE,
+    sample_chi_epidemic = TRUE,
     sample_rho = TRUE,
     sample_sigma = TRUE,
     sample_zeta_1 = TRUE,
     sample_zeta_2 = TRUE,
 
-    # Location-specific parameter sampling controls (13 parameters)
+    # Location-specific parameter sampling controls
     sample_beta_j0_tot = TRUE,
     sample_p_beta = TRUE,
     sample_tau_i = TRUE,
@@ -140,7 +149,12 @@ sample_parameters <- function(
     sample_a2 = TRUE,
     sample_b1 = TRUE,
     sample_b2 = TRUE,
-    sample_mu_j = TRUE,
+    sample_mu_j_baseline = TRUE,
+    sample_mu_j_slope = TRUE,
+    sample_mu_j_epidemic_factor = TRUE,
+    sample_epidemic_threshold = TRUE,
+    sample_delta_reporting_cases = TRUE,
+    sample_delta_reporting_deaths = TRUE,
 
     # psi_star calibration parameters
     sample_psi_star_a = TRUE,
@@ -240,6 +254,29 @@ sample_parameters <- function(
     sampling_flags,
     verbose
   )
+
+  # Enforce zeta_1 > zeta_2: symptomatic shedding must exceed asymptomatic.
+  # make_LASER_config() stops if this is violated. With both at sdlog=3.0,
+  # ~29% of independent draws violate the constraint — swap rather than reject.
+  if (!is.null(config_sampled$zeta_1) && !is.null(config_sampled$zeta_2)) {
+    if (config_sampled$zeta_1 <= config_sampled$zeta_2) {
+      tmp <- config_sampled$zeta_1
+      config_sampled$zeta_1 <- config_sampled$zeta_2
+      config_sampled$zeta_2 <- tmp
+    }
+  }
+
+  # Enforce decay_days_short < decay_days_long: minimum survival must be less
+  # than maximum. make_LASER_config() stops if this is violated. Swap rather
+  # than reject to preserve the marginal distributions.
+  if (!is.null(config_sampled$decay_days_short) &&
+      !is.null(config_sampled$decay_days_long)) {
+    if (config_sampled$decay_days_short >= config_sampled$decay_days_long) {
+      tmp <- config_sampled$decay_days_short
+      config_sampled$decay_days_short <- config_sampled$decay_days_long
+      config_sampled$decay_days_long <- tmp
+    }
+  }
 
   # Sample location-specific parameters
   config_sampled <- sample_location_parameters_impl(
@@ -377,6 +414,11 @@ sample_global_parameters_impl <- function(config_sampled, global_params,
         prior = global_params[[param_name]],
         verbose = FALSE
       )
+
+      # delta_reporting_* are integer days; make_LASER_config() rejects non-integers
+      if (param_name %in% c("delta_reporting_cases", "delta_reporting_deaths")) {
+        sampled_value <- as.integer(round(sampled_value))
+      }
 
       config_sampled[[param_name]] <- sampled_value
 
@@ -832,15 +874,18 @@ validate_sampled_config <- function(config_sampled, verbose = TRUE) {
   schema <- list(
     global = list(
       params = c("phi_1", "phi_2", "omega_1", "omega_2", "iota",
-                "gamma_1", "gamma_2", "epsilon", "rho", "sigma",
-                "mobility_omega", "mobility_gamma", "zeta_1", "zeta_2",
-                "kappa", "alpha_1", "alpha_2", "decay_days_long",
-                "decay_days_short", "decay_shape_1", "decay_shape_2"),
+                "gamma_1", "gamma_2", "epsilon", "chi_endemic", "chi_epidemic",
+                "rho", "sigma", "mobility_omega", "mobility_gamma",
+                "zeta_1", "zeta_2", "kappa", "alpha_1", "alpha_2",
+                "decay_days_long", "decay_days_short", "decay_shape_1", "decay_shape_2",
+                "delta_reporting_cases", "delta_reporting_deaths"),
       type = "scalar"
     ),
     location = list(
       params = c("beta_j0_env", "beta_j0_hum", "tau_i", "theta_j",
-                "a_1_j", "a_2_j", "b_1_j", "b_2_j"),
+                "a_1_j", "a_2_j", "b_1_j", "b_2_j",
+                "mu_j_baseline", "mu_j_slope", "mu_j_epidemic_factor",
+                "epidemic_threshold"),
       type = "vector"
     ),
     bounds = list(
@@ -1257,7 +1302,8 @@ create_sampling_args <- function(pattern = "all",
     disease_params <- c("sample_phi_1", "sample_phi_2",
                        "sample_omega_1", "sample_omega_2",
                        "sample_gamma_1", "sample_gamma_2",
-                       "sample_epsilon", "sample_rho",
+                       "sample_epsilon", "sample_chi_endemic",
+                       "sample_chi_epidemic", "sample_rho",
                        "sample_sigma", "sample_iota")
     param_names <- names(all_params)
     all_params <- lapply(param_names, function(n) {

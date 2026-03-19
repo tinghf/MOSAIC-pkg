@@ -3,7 +3,7 @@
 #' @description
 #' Explicitly attaches the r-mosaic Python environment to the current R session.
 #' This function initializes Python with the r-mosaic environment, making all
-#' MOSAIC Python dependencies (laser_cholera, torch, zuko, etc.) available.
+#' MOSAIC Python dependencies (laser.cholera, torch, zuko, etc.) available.
 #'
 #' The function:
 #' \itemize{
@@ -102,7 +102,7 @@ attach_mosaic_env <- function(silent = FALSE) {
      } else {
           # Python not initialized - initialize it now
           tryCatch({
-               reticulate::use_condaenv(paths$norm, required = TRUE)
+               reticulate::use_condaenv(paths$env, required = TRUE)
 
                # Verify it worked
                config <- reticulate::py_config()

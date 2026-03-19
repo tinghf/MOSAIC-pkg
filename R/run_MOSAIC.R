@@ -4,6 +4,35 @@
 # =============================================================================
 
 # =============================================================================
+# PYTHON COMPATIBILITY HELPER
+# =============================================================================
+
+# Wrap location-specific scalar params as R lists so reticulate passes them as
+# Python lists instead of Python scalars.  Python's dict_to_propertysetex uses
+# np.array() (not as_ndarray()) for these params, so a Python scalar produces a
+# 0-d array (shape ()) rather than the expected 1-d array (shape (npatches,)).
+# This only affects single-location runs where length == 1.
+#
+# @param config A MOSAIC config list
+# @return config with affected length-1 params wrapped as R lists
+# @noRd
+.mosaic_prepare_config_for_python <- function(config) {
+  array_params <- c(
+    "psi_star_a", "psi_star_b", "psi_star_z", "psi_star_k",
+    "beta_j0_tot", "p_beta",
+    "prop_S_initial", "prop_E_initial", "prop_I_initial",
+    "prop_R_initial", "prop_V1_initial", "prop_V2_initial",
+    "mu_j_baseline", "mu_j_slope", "mu_j_epidemic_factor"
+  )
+  for (p in array_params) {
+    if (!is.null(config[[p]]) && length(config[[p]]) == 1 && !is.list(config[[p]])) {
+      config[[p]] <- as.list(config[[p]])
+    }
+  }
+  config
+}
+
+# =============================================================================
 # SIMULATION WORKER FUNCTION
 # =============================================================================
 
@@ -37,12 +66,25 @@
   result_matrix <- matrix(NA_real_, nrow = n_iterations, ncol = 5 + n_params)
   colnames(result_matrix) <- c('sim', 'iter', 'seed_sim', 'seed_iter', 'likelihood', param_names_all)
 
-  # Pre-allocate output matrix (estimated size, will grow if needed)
-  # Estimate: assume ~10 locations × 100 time points = 1000 rows per iteration
-  estimated_rows <- n_iterations * 1000
-  output_matrix <- matrix(NA_character_, nrow = estimated_rows, ncol = 6)
-  colnames(output_matrix) <- c('sim', 'iter', 'j', 't', 'cases', 'deaths')
-  output_row_idx <- 1L
+  # Timeseries accumulators — only allocated when NPE requires them.
+  # Old approach: character matrix + O(n_j * n_t * n_iter)^2 string-search
+  #   collapse ran unconditionally even when save_timeseries = FALSE.
+  # New approach: numeric accumulator matrices summed in-place each iteration;
+  #   final mean computed in O(n_j * n_t) with vectorised arithmetic.
+  ts_cases_sum  <- NULL
+  ts_deaths_sum <- NULL
+  ts_iter_count <- 0L
+  ts_n_j        <- 0L
+  ts_n_t        <- 0L
+
+  if (save_timeseries) {
+    ts_n_j <- length(config$location_name)
+    ts_n_t <- if (!is.null(config$reported_cases)) ncol(config$reported_cases) else 0L
+    if (ts_n_j > 0L && ts_n_t > 0L) {
+      ts_cases_sum  <- matrix(0.0, nrow = ts_n_j, ncol = ts_n_t)
+      ts_deaths_sum <- matrix(0.0, nrow = ts_n_j, ncol = ts_n_t)
+    }
+  }
 
   # Sample parameters ONCE per simulation
   params_sim <- tryCatch({
@@ -67,7 +109,7 @@
   # Parallel mode: lc exists in worker global environment
   # Sequential mode: import here
   if (!exists("lc", where = .GlobalEnv, inherits = FALSE)) {
-    lc <- reticulate::import("laser_cholera.metapop.model")
+    lc <- reticulate::import("laser.cholera.metapop.model")
   } else {
     lc <- get("lc", envir = .GlobalEnv)
   }
@@ -75,7 +117,7 @@
   # Run iterations
   for (j in 1:n_iterations) {
     # Use iteration-specific seed (see seed scheme documentation above)
-    seed_ij <- (sim_id - 1L) * n_iterations + j
+    seed_ij <- as.integer((sim_id - 1L) * n_iterations + j)
     params <- params_sim
     params$seed <- seed_ij
 
@@ -101,9 +143,12 @@
       }
     }
 
+    # Prepare config for Python (wrap length-1 array params as lists)
+    params_py <- .mosaic_prepare_config_for_python(params)
+
     # Run model
     model <- tryCatch({
-      lc$run_model(paramfile = params, quiet = TRUE)
+      lc$run_model(paramfile = params_py, quiet = TRUE)
     }, error = function(e) {
       # Log model run failure (but don't fail entire simulation)
       warning("Simulation ", sim_id, " iteration ", j, " model run failed: ",
@@ -115,7 +160,7 @@
     if (!is.null(model)) {
       likelihood <- tryCatch({
         obs_cases <- params$reported_cases
-        est_cases <- model$results$expected_cases
+        est_cases <- model$results$reported_cases  # v0.11.1: reported_cases = Isym*rho/chi (comparable to surveillance data)
         obs_deaths <- params$reported_deaths
         est_deaths <- model$results$disease_deaths
 
@@ -158,42 +203,21 @@
 
       result_matrix[j, 5] <- likelihood
 
-      # Store time series outputs
-      est_cases_array <- model$results$expected_cases
-      est_deaths_array <- model$results$disease_deaths
+      # Accumulate time series outputs (only when NPE timeseries are needed)
+      if (save_timeseries && !is.null(ts_cases_sum)) {
+        est_cases_array  <- model$results$reported_cases
+        est_deaths_array <- model$results$disease_deaths
 
-      if (!is.null(est_cases_array) && !is.null(est_deaths_array)) {
-        # Ensure matrix format
-        if (!is.matrix(est_cases_array)) {
-          est_cases_array <- matrix(est_cases_array, nrow = 1)
-          est_deaths_array <- matrix(est_deaths_array, nrow = 1)
-        }
-
-        n_j <- nrow(est_cases_array)
-        n_t <- ncol(est_cases_array)
-        n_rows_needed <- n_j * n_t
-
-        # Check if we need to grow the output matrix
-        if (output_row_idx + n_rows_needed - 1 > nrow(output_matrix)) {
-          # Grow to exact size needed (not just double, which may be insufficient)
-          rows_to_add <- (output_row_idx + n_rows_needed - 1) - nrow(output_matrix)
-          new_rows <- matrix(NA_character_, nrow = rows_to_add, ncol = 6)
-          colnames(new_rows) <- colnames(output_matrix)
-          output_matrix <- rbind(output_matrix, new_rows)
-        }
-
-        # Write directly to pre-allocated matrix (FIXED: no rbind in loop!)
-        for (loc_idx in 1:n_j) {
-          for (t_idx in 1:n_t) {
-            output_matrix[output_row_idx, ] <- c(
-              as.character(sim_id),
-              as.character(j),
-              as.character(loc_idx),
-              as.character(t_idx),
-              as.character(est_cases_array[loc_idx, t_idx]),
-              as.character(est_deaths_array[loc_idx, t_idx])
-            )
-            output_row_idx <- output_row_idx + 1L
+        if (!is.null(est_cases_array) && !is.null(est_deaths_array)) {
+          if (!is.matrix(est_cases_array)) {
+            est_cases_array  <- matrix(est_cases_array,  nrow = 1)
+            est_deaths_array <- matrix(est_deaths_array, nrow = 1)
+          }
+          # Only accumulate if dimensions match the pre-allocated accumulators
+          if (nrow(est_cases_array) == ts_n_j && ncol(est_cases_array) == ts_n_t) {
+            ts_cases_sum  <- ts_cases_sum  + est_cases_array
+            ts_deaths_sum <- ts_deaths_sum + est_deaths_array
+            ts_iter_count <- ts_iter_count + 1L
           }
         }
       }
@@ -258,43 +282,29 @@
   output_file <- file.path(dir_bfrs_parameters, sprintf("sim_%07d.parquet", sim_id))
   .mosaic_write_parquet(as.data.frame(result_matrix), output_file, io)
 
-  # Collapse and write time series
-  if (nrow(output_matrix) > 0) {
-    unique_combos <- unique(output_matrix[, c(3, 4)])
-    n_combos <- nrow(unique_combos)
+  # Write timeseries file (NPE only) — O(n_j * n_t) vectorised mean from accumulators.
+  # No string conversion, no nested loops, no linear scan per (j,t) cell.
+  if (save_timeseries && ts_iter_count > 0L &&
+      !is.null(ts_cases_sum) && !is.null(dir_bfrs_timeseries)) {
 
-    collapsed_matrix <- matrix(NA_real_, nrow = n_combos, ncol = 6)
-    colnames(collapsed_matrix) <- c('sim', 'iter', 'j', 't', 'cases', 'deaths')
+    cases_mean  <- ts_cases_sum  / ts_iter_count
+    deaths_mean <- ts_deaths_sum / ts_iter_count
 
-    for (i in 1:n_combos) {
-      j_val <- as.integer(unique_combos[i, 1])
-      t_val <- as.integer(unique_combos[i, 2])
-
-      match_rows <- output_matrix[, 3] == as.character(j_val) &
-                    output_matrix[, 4] == as.character(t_val)
-      matching_data <- output_matrix[match_rows, , drop = FALSE]
-
-      collapsed_matrix[i, ] <- c(
-        sim_id, 1, j_val, t_val,
-        mean(as.numeric(matching_data[, 5]), na.rm = TRUE),
-        mean(as.numeric(matching_data[, 6]), na.rm = TRUE)
-      )
-    }
+    # Build long-format index (row-major: j varies slowest, t fastest)
+    j_idx <- rep(seq_len(ts_n_j), times = ts_n_t)
+    t_idx <- rep(seq_len(ts_n_t), each  = ts_n_j)
 
     collapsed_df <- data.frame(
-      sim = as.integer(collapsed_matrix[, 1]),
-      iter = as.integer(collapsed_matrix[, 2]),
-      j = as.integer(collapsed_matrix[, 3]),
-      t = as.integer(collapsed_matrix[, 4]),
-      cases = as.numeric(collapsed_matrix[, 5]),
-      deaths = as.numeric(collapsed_matrix[, 6])
+      sim    = sim_id,
+      iter   = 1L,
+      j      = j_idx,
+      t      = t_idx,
+      cases  = as.numeric(cases_mean),
+      deaths = as.numeric(deaths_mean)
     )
 
-    # Only write timeseries files if NPE is enabled
-    if (save_timeseries && !is.null(dir_bfrs_timeseries)) {
-      out_file <- file.path(dir_bfrs_timeseries, sprintf("timeseries_%07d.parquet", sim_id))
-      .mosaic_write_parquet(collapsed_df, out_file, io)
-    }
+    out_file <- file.path(dir_bfrs_timeseries, sprintf("timeseries_%07d.parquet", sim_id))
+    .mosaic_write_parquet(collapsed_df, out_file, io)
   }
 
   # CRITICAL: Cleanup Python objects after EACH simulation completes
@@ -350,7 +360,6 @@
 #'     \item \code{sampling}: Which parameters to sample vs hold fixed
 #'     \item \code{parallel}: Cluster settings for parallel execution
 #'   }
-#' @param resume Logical. If \code{TRUE}, continues from existing checkpoint. Default: FALSE.
 #'
 #' @return Invisibly returns a list with:
 #' \describe{
@@ -447,8 +456,7 @@
 run_MOSAIC <- function(config,
                        priors,
                        dir_output,
-                       control = NULL,
-                       resume = FALSE) {
+                       control = NULL) {
 
   # ===========================================================================
   # ARGUMENT VALIDATION
@@ -460,9 +468,7 @@ run_MOSAIC <- function(config,
     "priors is required and must be a list" =
       !missing(priors) && is.list(priors) && length(priors) > 0,
     "dir_output is required and must be character string" =
-      !missing(dir_output) && is.character(dir_output) && length(dir_output) == 1L,
-    "resume must be logical" =
-      is.logical(resume) && length(resume) == 1L
+      !missing(dir_output) && is.character(dir_output) && length(dir_output) == 1L
   )
 
   # Validate config structure
@@ -632,8 +638,32 @@ run_MOSAIC <- function(config,
     stop("No estimated parameters found for ESS tracking")
   }
 
-  log_msg("Parameters: %d estimated (of %d total) | Locations: %s",
-          length(param_names_estimated), length(param_names_all),
+  # Derive disabled parameter names from sampling_args flags so the log
+  # message reflects the actual number being sampled in this run.
+  # Flags use "sample_<name>" convention; strip the prefix to get the config
+  # key. Handle the special-case name mappings used in sample_parameters.R.
+  disabled_base_params <- character(0)
+  if (!is.null(sampling_args)) {
+    disabled_flags <- names(sampling_args)[vapply(sampling_args, isFALSE, logical(1))]
+    disabled_base <- gsub("^sample_", "", disabled_flags)
+    special_map <- list(
+      beta_j0_tot = c("beta_j0_hum", "beta_j0_env"),
+      a1 = "a_1_j", a2 = "a_2_j",
+      b1 = "b_1_j", b2 = "b_2_j"
+    )
+    resolved <- unlist(lapply(disabled_base, function(nm) {
+      if (nm %in% names(special_map)) special_map[[nm]] else nm
+    }))
+    disabled_base_params <- unique(resolved)
+  }
+
+  param_names_sampled <- param_names_estimated[
+    !(gsub("_[A-Z]{3}$", "", param_names_estimated) %in% disabled_base_params)
+  ]
+
+  log_msg("Parameters: %d sampled (of %d estimable, %d total) | Locations: %s",
+          length(param_names_sampled), length(param_names_estimated),
+          length(param_names_all),
           paste(config$location_name, collapse = ', '))
 
   # ===========================================================================
@@ -708,7 +738,7 @@ run_MOSAIC <- function(config,
 
       # Import laser-cholera ONCE per worker (not per simulation)
       # This avoids repeated import overhead (~5ms per simulation)
-      lc <- reticulate::import("laser_cholera.metapop.model")
+      lc <- reticulate::import("laser.cholera.metapop.model")
       assign("lc", lc, envir = .GlobalEnv)  # Store in global for worker function
 
       # Suppress NumPy warnings
@@ -755,23 +785,7 @@ run_MOSAIC <- function(config,
   nspec <- .mosaic_normalize_n_sims(n_simulations)
   state_file <- file.path(dirs$bfrs_diag, "run_state.rds")
 
-  # Load state with validation (FIXED: Issue 1.4)
-  state <- if (resume && file.exists(state_file)) {
-    log_msg("Attempting to resume from: %s", state_file)
-    loaded_state <- .mosaic_load_state_safe(state_file)
-
-    if (is.null(loaded_state)) {
-      log_msg("WARNING: Failed to load or validate state file")
-      log_msg("Starting fresh calibration")
-      .mosaic_init_state(control, param_names_estimated, nspec)
-    } else {
-      log_msg("Successfully loaded state (batch %d, %d simulations completed)",
-              loaded_state$batch_number, loaded_state$total_sims_run)
-      loaded_state
-    }
-  } else {
-    .mosaic_init_state(control, param_names_estimated, nspec)
-  }
+  state <- .mosaic_init_state(control, param_names_sampled, nspec)
 
   log_msg("Starting simulation (mode: %s)", state$mode)
   start_time <- Sys.time()
@@ -786,17 +800,8 @@ run_MOSAIC <- function(config,
 
     log_msg("[FIXED MODE] Running exactly %d simulations", target)
 
-    # Find existing files if resuming (FIXED: Issue 1.5 - safe sim ID parsing)
-    done_ids <- integer()
-    if (resume) {
-      existing <- list.files(dirs$bfrs_params, pattern = "^sim_[0-9]{7}\\.parquet$", full.names = FALSE)
-      if (length(existing)) {
-        done_ids <- .mosaic_parse_sim_ids(existing, pattern = "^sim_0*([0-9]+)\\.parquet$")
-        log_msg("Found %d existing simulations to skip", length(done_ids))
-      }
-    }
-
     all_ids <- seq_len(target)
+    done_ids <- integer()
     sim_ids <- setdiff(all_ids, done_ids)
 
     if (length(sim_ids) == 0L) {
@@ -957,14 +962,13 @@ run_MOSAIC <- function(config,
               state$batch_number, n_success_batch, length(sim_ids),
               batch_success_rate, as.numeric(batch_runtime))
 
-      # ESS convergence check (skips automatically if insufficient samples)
-      # Skip if final batch - we're about to load data anyway for final processing
-      if (state$total_sims_run < control$calibration$max_simulations) {
-        state <- .mosaic_ess_check_update_state(state, dirs, param_names_estimated, control)
-        .mosaic_save_state(state, state_file)
-      } else {
-        log_msg("Skipping ESS check (final batch)")
-      }
+      # ESS convergence check — always run so state$converged is accurate.
+      # The old guard skipped this when total_sims_run >= max_simulations,
+      # which meant the final batch never updated the converged flag and
+      # always emitted a spurious "no convergence" warning even when the
+      # target was met on that last batch.
+      state <- .mosaic_ess_check_update_state(state, dirs, param_names_sampled, control)
+      .mosaic_save_state(state, state_file)
 
       if (state$total_sims_run >= control$calibration$max_simulations && !state$converged) {
         log_msg("WARNING: Reached maximum simulations (%d) without convergence",
@@ -1017,11 +1021,18 @@ run_MOSAIC <- function(config,
     iqr <- q3 - q1
     iqr_mult <- control$weights$iqr_multiplier
     lower_threshold <- q1 - iqr_mult * iqr
-    upper_threshold <- q3 + iqr_mult * iqr
-    results$is_outlier[results$is_valid] <- valid_ll < lower_threshold | valid_ll > upper_threshold
 
-    log_msg("  Outlier detection (Tukey IQR, multiplier = %.1f):", iqr_mult)
-    log_msg("    - Outliers: %d (%.1f%%)", sum(results$is_outlier),
+    # Only apply the lower fence. Log-likelihoods have a long left tail (many
+    # poor fits) but are bounded above near 0. Applying an upper fence via
+    # Q3 + k*IQR would incorrectly discard the highest-likelihood simulations
+    # — exactly the models we want to keep for the posterior. The lower fence
+    # removes pathologically bad simulations that survived the guardrails.
+    results$is_outlier[results$is_valid] <- valid_ll < lower_threshold
+
+    log_msg("  Outlier detection (Tukey lower fence only, multiplier = %.1f):", iqr_mult)
+    log_msg("    - Lower threshold: %.1f | Outliers: %d (%.1f%%)",
+            lower_threshold,
+            sum(results$is_outlier),
             100 * sum(results$is_outlier) / sum(results$is_valid))
   }
 
@@ -1052,7 +1063,7 @@ run_MOSAIC <- function(config,
   log_msg("Calculating parameter ESS")
   ess_results <- calc_model_ess_parameter(
     results = results,
-    param_names = param_names_estimated,
+    param_names = param_names_sampled,
     likelihood_col = "likelihood",
     n_grid = 100,
     method = control$targets$ESS_method,
@@ -1461,8 +1472,8 @@ run_MOSAIC <- function(config,
   jsonlite::write_json(config_best, config_best_file, pretty = TRUE, auto_unbox = TRUE)
   log_msg("Saved %s", config_best_file)
 
-  lc <- reticulate::import("laser_cholera.metapop.model")
-  best_model <- lc$run_model(paramfile = config_best, quiet = TRUE)
+  lc <- reticulate::import("laser.cholera.metapop.model")
+  best_model <- lc$run_model(paramfile = MOSAIC:::.mosaic_prepare_config_for_python(config_best), quiet = TRUE)
 
   if (control$paths$plots) {
     log_msg("Generating posterior predictive plots (best model)...")
@@ -1559,7 +1570,7 @@ run_MOSAIC <- function(config,
       priors = priors,
       config = config,
       control = control,
-      param_names = param_names_estimated,
+      param_names = param_names_sampled,
       dirs = dirs,
       PATHS = PATHS,
       verbose = control$logging$verbose
@@ -1840,8 +1851,12 @@ mosaic_control_defaults <- function(calibration = NULL,
     sample_phi_2 = TRUE,             # Vaccine coverage (2 doses)
 
     # Reporting/observation
-    sample_sigma = TRUE,             # Reporting rate
+    sample_sigma = TRUE,             # Proportion symptomatic
     sample_kappa = TRUE,             # Overdispersion parameter
+    sample_chi_endemic = TRUE,       # PPV among suspected cases (endemic)
+    sample_chi_epidemic = TRUE,      # PPV among suspected cases (epidemic)
+    sample_delta_reporting_cases = TRUE,  # Infection-to-case reporting delay
+    sample_delta_reporting_deaths = TRUE, # Infection-to-death reporting delay
 
     # Environmental decay
     sample_decay_days_long = TRUE,   # Long-term environmental decay
@@ -1853,13 +1868,16 @@ mosaic_control_defaults <- function(calibration = NULL,
     sample_zeta_1 = TRUE,            # Advanced parameter 1
     sample_zeta_2 = TRUE,            # Advanced parameter 2
 
-    # === LOCATION-SPECIFIC PARAMETERS (13) ===
+    # === LOCATION-SPECIFIC PARAMETERS ===
     # Transmission and seasonality
     sample_beta_j0_tot = TRUE,       # Baseline transmission rate by location
-    sample_p_beta = TRUE,            # Proportion of seasonality
-    sample_tau_i = TRUE,             # Rainfall effect timing
-    sample_theta_j = TRUE,           # Temperature seasonal effect
-    sample_mu_j = TRUE,              # Baseline rate by location
+    sample_p_beta = TRUE,            # Proportion human-to-human transmission
+    sample_tau_i = TRUE,             # Travel/diffusion probability
+    sample_theta_j = TRUE,           # WASH coverage
+    sample_mu_j_baseline = TRUE,     # Baseline location-specific IFR
+    sample_mu_j_slope = TRUE,        # Temporal IFR trend
+    sample_mu_j_epidemic_factor = TRUE, # Epidemic IFR multiplier
+    sample_epidemic_threshold = TRUE, # Epidemic activation threshold
 
     # Climate relationship
     sample_a1 = TRUE,                # Temperature coefficient 1

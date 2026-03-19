@@ -441,9 +441,12 @@
 
   # Only create NPE-specific directories when NPE is enabled
   if (run_npe) {
-    d$bfrs_times = file.path(dir_output, "1_bfrs/outputs/timeseries")
-    d$npe <- file.path(dir_output, "2_npe")
-    d$npe_plots <- file.path(dir_output, "2_npe/plots")
+    d$bfrs_times    <- file.path(dir_output, "1_bfrs/outputs/timeseries")
+    d$npe           <- file.path(dir_output, "2_npe")
+    d$npe_model     <- file.path(dir_output, "2_npe/model")
+    d$npe_posterior <- file.path(dir_output, "2_npe/posterior")
+    d$npe_diagnostics <- file.path(dir_output, "2_npe/diagnostics")
+    d$npe_plots     <- file.path(dir_output, "2_npe/plots")
   }
 
   if (clean_output && dir.exists(d$root)) {
@@ -720,9 +723,22 @@
     log_msg("  Data points: %d measurements (batches 1-%d) | Simulations: %d-%d",
             nrow(ess_df), state$batch_number, min(ess_df$sims), max(ess_df$sims))
 
-    # Check if calibration should end
-    if (r2 >= control$calibration$target_r2 ||
-        state$batch_number >= control$calibration$max_batches) {
+    # Check if calibration should end.
+    # R² is only used as an exit signal when there are at least 5 data points
+    # (3 residual df). A 2-parameter model fit to exactly min_batches=3 points
+    # has only 1 residual df, making R² trivially near 1 for any monotone ESS
+    # trajectory. The max_batches hard limit is always honoured regardless.
+    min_r2_points <- 5L
+    r2_converged <- r2 >= control$calibration$target_r2 && nrow(ess_df) >= min_r2_points
+    if (r2_converged) {
+      log_msg("  R² criterion met with %d data points (min required: %d)",
+              nrow(ess_df), min_r2_points)
+    } else if (r2 >= control$calibration$target_r2 && nrow(ess_df) < min_r2_points) {
+      log_msg("  R² = %.4f >= target, but only %d data point(s) — need >= %d for reliable R²",
+              r2, nrow(ess_df), min_r2_points)
+    }
+
+    if (r2_converged || state$batch_number >= control$calibration$max_batches) {
 
       # Calculate remaining gap
       current_n <- nrow(ess_check_results)
@@ -779,14 +795,20 @@
     log_msg("  → Predictive batch complete, proceeding to fine-tuning")
   }
 
-  # Check convergence
-  n_converged <- sum(ess_current$ess_marginal >= control$targets$ESS_param, na.rm = TRUE)
-  prop_converged <- n_converged / length(param_names_est)
+  # Check convergence.
+  # Use only parameters that produced a valid ESS estimate as the denominator.
+  # Parameters whose KDE failed return NA in ess_marginal; dividing by
+  # length(param_names_est) would count them as "not converged" and make
+  # the target proportion artificially harder to reach.
+  n_converged    <- sum(ess_current$ess_marginal >= control$targets$ESS_param, na.rm = TRUE)
+  n_ess_computed <- sum(!is.na(ess_current$ess_marginal))
+  prop_converged <- if (n_ess_computed > 0L) n_converged / n_ess_computed else 0
 
   if (prop_converged >= control$targets$ESS_param_prop) {
     state$converged <- TRUE
-    log_msg("  → CONVERGENCE ACHIEVED: %.1f%% of parameters at ESS >= %.0f",
-            prop_converged * 100, control$targets$ESS_param)
+    log_msg("  → CONVERGENCE ACHIEVED: %.1f%% of parameters at ESS >= %.0f (computed on %d/%d params)",
+            prop_converged * 100, control$targets$ESS_param,
+            n_ess_computed, length(param_names_est))
   }
 
   # Clean up and return
@@ -968,12 +990,18 @@
   # (not used in weight calculation, just for reporting)
   temperature <- 0.5 * (effective_range / actual_range)
 
-  # Calculate Gibbs weights using inverse temperature
-  weights <- calc_model_weights_gibbs(
-    x = delta_aic,
-    temperature = eta,  # Note: this parameter is actually inverse temperature
+  # Calculate Gibbs weights using inverse temperature — valid models only.
+  # delta_aic[!valid_idx] = Inf; passing the full vector to calc_model_weights_gibbs
+  # would crash because that function stop()s on any non-finite input. Compute
+  # weights on the valid subset, then place them back into a full-length vector
+  # (invalid models receive weight 0 and are silently dropped by calc_model_ess).
+  weights_valid <- calc_model_weights_gibbs(
+    x = delta_aic[valid_idx],
+    temperature = eta,
     verbose = FALSE
   )
+  weights <- numeric(n_total)
+  weights[valid_idx] <- weights_valid
 
   # ===========================================================================
   # Calculate ESS metrics

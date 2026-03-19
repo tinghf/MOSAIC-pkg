@@ -140,6 +140,12 @@ calc_model_posterior_distributions <- function(
     n_failed <- 0
     failed_params <- character()
 
+    # Track which parameters actually appear in the quantiles file so that
+    # parameters absent from the file (and thus unchanged copies of the prior)
+    # can be removed from posteriors after the loop.
+    quantiles_global_params   <- character()
+    quantiles_location_params <- character()  # "param_base:location"
+
     if (verbose) {
         message("\nProcessing ", nrow(quantiles), " posterior parameters...")
         message("------------------------------------------------")
@@ -150,21 +156,24 @@ calc_model_posterior_distributions <- function(
         param_row <- quantiles[i, ]
         param_name <- param_row$parameter
 
-        # Get distribution type
-        dist_type <- param_row$prior_distribution
-
-        # Handle both column names (for backward compatibility)
-        if ("scale" %in% names(param_row)) {
-            param_scale <- param_row$scale
-        } else if ("param_type" %in% names(param_row)) {
-            param_scale <- param_row$param_type
+        # Get distribution type for posterior fitting.
+        # Use posterior_distribution when present (allows decoupling the posterior
+        # family from the prior family for parameters with uniform priors).
+        # Falls back to prior_distribution for backward compatibility with CSV
+        # files written before posterior_distribution was added.
+        dist_type <- if ("posterior_distribution" %in% names(param_row) &&
+                         !is.na(param_row$posterior_distribution) &&
+                         nchar(trimws(param_row$posterior_distribution)) > 0) {
+            param_row$posterior_distribution
         } else {
-            param_scale <- "unknown"
+            param_row$prior_distribution
         }
+
+        param_scale <- if ("param_type" %in% names(param_row)) param_row$param_type else "unknown"
 
         # Determine if location-specific
         location <- param_row$location
-        if (is.na(location) || location == "" || location == "NA") {
+        if (is.na(location) || location == "") {
             location <- NULL
         }
 
@@ -175,14 +184,13 @@ calc_model_posterior_distributions <- function(
             param_base <- param_name
         }
 
-        # Map seasonality parameter names (handle both a_1_j and a1 formats)
+        # Seasonality Fourier coefficients are stored as a_1_j / a_2_j / b_1_j / b_2_j
+        # in simulation results (matching the LASER config key names) but priors.json
+        # uses the compact forms a1 / a2 / b1 / b2.  Convert here so the priors lookup
+        # below finds the correct key.
         if (param_base %in% c("a_1_j", "a_2_j", "b_1_j", "b_2_j")) {
-            param_base_original <- param_base
-            param_base <- gsub("_j$", "", param_base)  # Remove _j suffix
-            param_base <- gsub("_", "", param_base)    # Remove underscores: a_1 -> a1
-            if (verbose && i == 1) {
-                message("  Mapping seasonality parameter: ", param_base_original, " -> ", param_base)
-            }
+            param_base <- gsub("_j$", "", param_base)   # a_1_j -> a_1
+            param_base <- gsub("_", "", param_base)      # a_1   -> a1
         }
 
         # Get quantiles
@@ -194,11 +202,11 @@ calc_model_posterior_distributions <- function(
         # Note: With small sample sizes (n<30), median is more stable than KDE mode
         if ("mode" %in% names(param_row) && !is.na(param_row$mode)) {
             mode_val <- param_row$mode
-            # Check if mode is reasonable (within CI)
+            # Check if mode is reasonable (within CI); always warn — this is a data quality signal
             if (mode_val < q_low || mode_val > q_high) {
-                if (verbose) {
-                    message("  Warning: Mode outside CI for ", param_name, ", using median instead")
-                }
+                message("  Warning: Mode outside CI for ", param_name,
+                        " (mode=", round(mode_val, 4), ", CI=[", round(q_low, 4), ",", round(q_high, 4), "]),",
+                        " using median instead")
                 mode_val <- q_med
             }
         } else {
@@ -208,6 +216,14 @@ calc_model_posterior_distributions <- function(
             }
         }
 
+        # Track which parameters appear in the quantiles file
+        if (param_scale == "global") {
+            quantiles_global_params <- unique(c(quantiles_global_params, param_base))
+        } else if (param_scale == "location" && !is.null(location)) {
+            quantiles_location_params <- unique(c(quantiles_location_params,
+                                                  paste0(param_base, ":", location)))
+        }
+
         # Skip if quantiles are missing
         if (is.na(q_low) || is.na(q_med) || is.na(q_high)) {
             if (verbose) {
@@ -215,6 +231,37 @@ calc_model_posterior_distributions <- function(
             }
             n_failed <- n_failed + 1
             failed_params <- c(failed_params, param_name)
+            next
+        }
+
+        # Detect near-zero-variance parameters (fixed / not sampled).
+        # When a parameter is held constant across all simulations, all three
+        # quantiles are identical. The downstream bounds correction would
+        # artificially expand the CI and produce a misleading "posterior".
+        # Instead, remove the parameter from the posteriors object so the
+        # distribution plot only shows the prior curve.
+        relative_range <- if (abs(q_med) > 1e-10) {
+            abs(q_high - q_low) / abs(q_med)
+        } else {
+            abs(q_high - q_low)
+        }
+        if (relative_range < 1e-4) {
+            if (verbose) {
+                message(sprintf("  [FIXED] %s - near-zero variance (q_low=%.6g, q_high=%.6g); storing as point value",
+                                param_name, q_low, q_high))
+            }
+            # Store as a "fixed" marker so the distribution plotter can draw
+            # a vertical line at the point value instead of a density curve.
+            fixed_marker <- list(
+                distribution = "fixed",
+                parameters   = list(value = q_med)
+            )
+            if (param_scale == "global") {
+                posteriors$parameters_global[[param_base]] <- fixed_marker
+            } else if (param_scale == "location" && !is.null(location)) {
+                posteriors$parameters_location[[param_base]]$location[[location]] <- fixed_marker
+            }
+            n_updated <- n_updated + 1
             next
         }
 
@@ -287,10 +334,39 @@ calc_model_posterior_distributions <- function(
                     verbose = FALSE
                 )
             } else if (dist_type == "truncnorm") {
+                # Read hard bounds from the prior template first.
+                # This preserves biological constraints in the posterior fit —
+                # e.g., psi_star_a >= 0 and psi_star_k <= 0.
+                # posterior_lower/upper columns override when present
+                # (e.g., delta_reporting_* integer support).
+                parse_bound <- function(x) {
+                    if (is.null(x)) return(NULL)
+                    if (is.character(x) && trimws(x) == "Inf")  return(Inf)
+                    if (is.character(x) && trimws(x) == "-Inf") return(-Inf)
+                    v <- suppressWarnings(as.numeric(x))
+                    if (is.na(v)) NULL else v
+                }
+                prior_entry <- if (!is.null(location)) {
+                    priors$parameters_location[[param_base]]$location[[location]]
+                } else {
+                    priors$parameters_global[[param_base]]
+                }
+                prior_a <- parse_bound(prior_entry$parameters$a)
+                prior_b <- parse_bound(prior_entry$parameters$b)
+
+                a_bound <- if ("posterior_lower" %in% names(param_row) &&
+                               !is.na(param_row$posterior_lower))
+                               as.numeric(param_row$posterior_lower) else prior_a
+                b_bound <- if ("posterior_upper" %in% names(param_row) &&
+                               !is.na(param_row$posterior_upper))
+                               as.numeric(param_row$posterior_upper) else prior_b
+
                 fitted_dist <- fit_truncnorm_from_ci(
                     mode_val = mode_val,
                     ci_lower = q_low,
                     ci_upper = q_high,
+                    a = a_bound,
+                    b = b_bound,
                     verbose = FALSE
                 )
             } else if (dist_type == "gompertz") {
@@ -431,6 +507,38 @@ calc_model_posterior_distributions <- function(
                 message("  Warning: Could not find ", param_name, " in posteriors structure")
             }
         }
+    }
+
+    # -------------------------------------------------------------------------
+    # Remove parameters that were never in the quantiles file.
+    # posteriors was initialised as a full copy of priors, so any parameter
+    # absent from the quantiles CSV would otherwise appear in the output JSON
+    # with its prior distribution unchanged, causing the distribution plot to
+    # draw both a "prior" curve and an identical "posterior" curve.
+    # -------------------------------------------------------------------------
+
+    # Global parameters not in quantiles file
+    for (param in setdiff(names(posteriors$parameters_global), quantiles_global_params)) {
+        posteriors$parameters_global[[param]] <- NULL
+    }
+
+    # Location-specific parameters not in quantiles file
+    for (pb in names(posteriors$parameters_location)) {
+        locs_in_quantiles <- sub(paste0("^", pb, ":"), "",
+                                 grep(paste0("^", pb, ":"), quantiles_location_params, value = TRUE))
+        locs_to_remove <- setdiff(names(posteriors$parameters_location[[pb]]$location),
+                                  locs_in_quantiles)
+        for (loc in locs_to_remove) {
+            posteriors$parameters_location[[pb]]$location[[loc]] <- NULL
+        }
+        if (length(posteriors$parameters_location[[pb]]$location) == 0) {
+            posteriors$parameters_location[[pb]] <- NULL
+        }
+    }
+
+    n_pruned <- length(setdiff(names(priors$parameters_global), names(posteriors$parameters_global)))
+    if (verbose && n_pruned > 0) {
+        message("  Removed ", n_pruned, " global parameters absent from quantiles file (not sampled)")
     }
 
     # Write posteriors to JSON
