@@ -107,10 +107,15 @@ def _apply_sampled_params(base_config: dict, sampled_params_json: str) -> dict:
 
     sampled = json.loads(sampled_params_json)
 
-    # Convert list → numpy 1-D array for known vector fields
+    # Convert to numpy 1-D array for known vector fields.
+    # Single-location countries produce scalars (not lists) after JSON
+    # deserialization, so we must handle both cases.
     for field, val in sampled.items():
-        if field in _VECTOR_FIELDS and isinstance(val, (list, tuple)):
-            sampled[field] = np.array(val, dtype=float)
+        if field in _VECTOR_FIELDS:
+            if isinstance(val, (list, tuple)):
+                sampled[field] = np.array(val, dtype=float)
+            elif isinstance(val, (int, float)):
+                sampled[field] = np.atleast_1d(np.array(val, dtype=float))
 
     # Convert list-of-lists → numpy 2-D array for matrix fields sent per-sim
     # (currently only psi_jt; other matrices are unchanged across sims)
@@ -188,7 +193,7 @@ def run_laser_sim(sim_id: int, n_iterations: int,
         os.environ[_var] = "1"
 
     try:
-        import laser_cholera.metapop.model as lc
+        import laser.cholera.metapop.model as lc
         import warnings as _warnings
         _warnings.filterwarnings(
             "ignore", message="invalid value encountered in divide"
