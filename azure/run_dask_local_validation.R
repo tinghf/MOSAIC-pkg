@@ -97,7 +97,7 @@ ctrl <- mosaic_control_defaults(
     clean_output = TRUE,
     plots        = FALSE         # skip plots for speed
   ),
-  io = mosaic_io_presets("fast")
+  io = c(mosaic_io_presets("fast"), save_simresults = TRUE)
 )
 
 # =============================================================================

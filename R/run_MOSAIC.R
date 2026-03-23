@@ -77,6 +77,9 @@
   ts_n_j        <- 0L
   ts_n_t        <- 0L
 
+  # Raw per-iteration output for validation simresults parquets
+  simresults_raw <- if (!is.null(dir_bfrs_simresults)) vector("list", n_iterations) else NULL
+
   if (save_timeseries) {
     ts_n_j <- length(config$location_name)
     ts_n_t <- if (!is.null(config$reported_cases)) ncol(config$reported_cases) else 0L
@@ -221,6 +224,26 @@
           }
         }
       }
+
+      # Capture raw per-(j, t) output for validation simresults
+      if (!is.null(simresults_raw)) {
+        raw_cases  <- model$results$reported_cases
+        raw_deaths <- model$results$disease_deaths
+        if (!is.null(raw_cases) && !is.null(raw_deaths)) {
+          if (!is.matrix(raw_cases))  raw_cases  <- matrix(raw_cases,  nrow = 1)
+          if (!is.matrix(raw_deaths)) raw_deaths <- matrix(raw_deaths, nrow = 1)
+          n_j_raw <- nrow(raw_cases)
+          n_t_raw <- ncol(raw_cases)
+          simresults_raw[[j]] <- data.frame(
+            sim    = sim_id,
+            iter   = as.integer(j),
+            j      = rep(seq_len(n_j_raw), times = n_t_raw),
+            t      = rep(seq_len(n_t_raw), each  = n_j_raw),
+            cases  = as.numeric(raw_cases),
+            deaths = as.numeric(raw_deaths)
+          )
+        }
+      }
     }
 
     # Explicit garbage collection to prevent Python object buildup
@@ -231,35 +254,24 @@
     }
   }
 
-  # Trim output matrix to actual size used
-  if (output_row_idx > 1) {
-    output_matrix <- output_matrix[1:(output_row_idx - 1), , drop = FALSE]
-  } else {
-    output_matrix <- output_matrix[0, , drop = FALSE]  # Empty matrix
-  }
-
   # Write raw (uncollapsed) simulation results for validation
-  if (!is.null(dir_bfrs_simresults) && nrow(output_matrix) > 0) {
-    raw_df <- data.frame(
-      sim    = as.integer(output_matrix[, 1]),
-      iter   = as.integer(output_matrix[, 2]),
-      j      = as.integer(output_matrix[, 3]),
-      t      = as.integer(output_matrix[, 4]),
-      cases  = as.numeric(output_matrix[, 5]),
-      deaths = as.numeric(output_matrix[, 6])
-    )
-    # Append simulation parameters (constant within a sim, replicated per row)
-    param_vals <- as.numeric(result_matrix[1, param_names_all])
-    for (pi in seq_along(param_names_all)) {
-      raw_df[[param_names_all[pi]]] <- param_vals[pi]
+  if (!is.null(simresults_raw) && !is.null(dir_bfrs_simresults)) {
+    simresults_raw <- Filter(Negate(is.null), simresults_raw)
+    if (length(simresults_raw) > 0) {
+      raw_df <- do.call(rbind, simresults_raw)
+      # Append simulation parameters (constant within a sim, replicated per row)
+      param_vals <- as.numeric(result_matrix[1, param_names_all])
+      for (pi in seq_along(param_names_all)) {
+        raw_df[[param_names_all[pi]]] <- param_vals[pi]
+      }
+      # Add psi_jt[j, t] for validation — the exact binary value LASER received
+      if (!is.null(params_sim$psi_jt)) {
+        raw_df$psi_jt <- params_sim$psi_jt[cbind(raw_df$j, raw_df$t)]
+      }
+      simresults_file <- file.path(dir_bfrs_simresults,
+                                   sprintf("simresults_%07d.parquet", sim_id))
+      .mosaic_write_parquet(raw_df, simresults_file, io)
     }
-    # Add psi_jt[j, t] for validation — the exact binary value LASER received
-    if (!is.null(params_sim$psi_jt)) {
-      raw_df$psi_jt <- params_sim$psi_jt[cbind(raw_df$j, raw_df$t)]
-    }
-    simresults_file <- file.path(dir_bfrs_simresults,
-                                 sprintf("simresults_%07d.parquet", sim_id))
-    .mosaic_write_parquet(raw_df, simresults_file, io)
   }
 
   # Collapse iterations if n_iterations > 1
@@ -570,6 +582,12 @@ run_MOSAIC <- function(config,
     run_npe = isTRUE(control$npe$enable),
     clean_output = isTRUE(control$paths$clean_output)
   )
+
+  # Skip per-sim simulation results files (validation only, heavy I/O).
+  # Set control$io$save_simresults = TRUE to re-enable for debugging.
+  if (!isTRUE(control$io$save_simresults)) {
+    dirs$bfrs_simresults <- NULL
+  }
 
   # ===========================================================================
   # WRITE SETUP FILES (with cluster metadata)
